@@ -79,6 +79,22 @@ export class SoundBank {
 
   shoot() { this._tone(720, 0.07, 'square', 0.35, 320); }
   hit() { this._tone(190, 0.05, 'triangle', 0.4, 120); }
+  dash() { this._noise(0.14, 0.4, 2600); this._tone(300, 0.14, 'sine', 0.3, 900); }
+  nova() { this._tone(180, 0.4, 'sine', 0.8, 720); this._noise(0.35, 0.6, 700); this._tone(1200, 0.3, 'triangle', 0.3, 2400, 0.03); }
+  shieldHit() { this._tone(1250, 0.05, 'square', 0.25, 900); }
+  shieldBreak() { this._noise(0.22, 0.6, 1800); this._tone(900, 0.25, 'sawtooth', 0.35, 180); }
+  arc() { this._tone(1600, 0.07, 'square', 0.22, 500); }
+  starfall() { this._noise(0.3, 0.8, 500); this._tone(90, 0.32, 'sine', 0.8, 40); }
+  roar() { this._tone(70, 0.6, 'sawtooth', 0.7, 45); this._tone(98, 0.5, 'sawtooth', 0.5, 60, 0.08); this._noise(0.5, 0.4, 300); }
+  bossDie() { this._noise(0.7, 0.9, 600); this._tone(160, 0.7, 'sawtooth', 0.6, 30); this._tone(523, 0.3, 'triangle', 0.4, null, 0.35); this._tone(784, 0.4, 'triangle', 0.4, null, 0.5); }
+  alarm() { this._tone(880, 0.11, 'square', 0.3); this._tone(880, 0.11, 'square', 0.3, null, 0.16); }
+  phoenix() { [392, 523, 659, 784, 1046].forEach((freq, i) => this._tone(freq, 0.26, 'sine', 0.5, null, i * 0.09)); }
+  ember() { this._tone(1180, 0.06, 'sine', 0.3, 1760); }
+  spit() { this._tone(420, 0.09, 'sawtooth', 0.25, 180); }
+  combo() { this._tone(880, 0.09, 'triangle', 0.4, 1320); }
+  split() { this._noise(0.12, 0.5, 1500); this._tone(520, 0.1, 'triangle', 0.3, 240); }
+  playerDie() { this._tone(392, 0.25, 'sine', 0.5, 98); this._noise(0.25, 0.5, 800); }
+  waveClear() { this._tone(523, 0.12, 'triangle', 0.45); this._tone(784, 0.18, 'triangle', 0.45, null, 0.1); }
   kill() { this._noise(0.16, 0.7, 900); this._tone(320, 0.14, 'sawtooth', 0.3, 60); }
   pickup() { this._tone(980, 0.08, 'sine', 0.4, 1560); }
   hurt() { this._tone(140, 0.18, 'sawtooth', 0.55, 70); }

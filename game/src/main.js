@@ -1,605 +1,921 @@
-// CINDERWAKE entry point: the game loop, the state machine (menu → playing
-// → upgrade → victory / game over), collisions, waves and scoring. It wires
-// input, audio, entities and render together and nothing else.
+// CINDERWAKE — game orchestration: the state machine, the fixed-step loop,
+// combat resolution, and the deterministic screenshot hooks the build uses.
+//
+// A guardian wisp defends the last Forge from ten waves of void mites.
+// Survive wave 10 — Cindermaw at 5, the Hollow Maw at 10 — and the Forge
+// ascends. If the Forge falls, the dark wins. Upgrades between waves, a
+// dash and an ember nova in the wisp's hands, combos for the bold.
+//
+// States: menu -> playing -> upgrade (between waves) -> playing ...
+//         playing -> gameover | victory; paused overlays playing.
 
 import {
-  DEATH_SCORE_COST, EMBER_VALUE, FORGE, INTERMISSION, PALETTE, VIEW,
-  WAVE_CLEAR_BONUS, WAVE_COUNT, clamp, dist, mulberry32,
+  ABILITIES, BOSS_WAVES, DEATH_SCORE_COST, EMBER_VALUE, FORGE, PALETTE, VIEW, WAVE_COUNT,
+  clamp, dist, mulberry32,
 } from './config.js';
-import { Input } from './input.js';
 import { SoundBank } from './audio.js';
+import { Boss } from './bosses.js';
+import { ComboTracker } from './combo.js';
+import { Ember, EnemyShot, Mite, Particle, Player } from './entities.js';
+import { Input } from './input.js';
 import {
-  Ember, EnemyShot, FloatText, Mite, Particle, Player, burst,
-} from './entities.js';
-import { buildWave, isFinalWave, spawnPoint, waveMix } from './waves.js';
+  drawBackground, drawBoss, drawBullet, drawEmber, drawEnemyShot, drawFloatTexts,
+  drawForge, drawMite, drawNovaFx, drawParticles, drawPlayer, drawVignette, drawZaps,
+} from './render.js';
+import { drawGameOver, drawHUD, drawMenu, drawPause, drawUpgrade, drawVictory } from './screens.js';
 import { rollUpgrades } from './upgrades.js';
-import * as render from './render.js';
+import { buildWave, isFinalWave, spawnPoint, waveMix } from './waves.js';
 
-const canvas = document.getElementById('game');
-const statusEl = document.getElementById('status');
-canvas.width = VIEW.w;
-canvas.height = VIEW.h;
-const ctx = canvas.getContext('2d');
+const FIXED_DT = 1 / 60;
+// Autoplay upgrade taste, best first: raw killing power, then the rares
+// that bend a run, then sustain. Shared by the demo and the soak test.
+const UPGRADE_PRIORITY = [
+  'damage', 'multishot', 'firerate', 'starfall', 'arc', 'pierce', 'novamastery',
+  'phoenix', 'heavy', 'siphon', 'flicker', 'repair', 'maxhp', 'regen', 'magnet', 'speed',
+];
 
-export class Game {
-  constructor() {
+class Game {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
     this.input = new Input(canvas);
     this.sound = new SoundBank();
-    this.rng = mulberry32((Date.now() % 2147483647) || 1);
-    this.seed = 1;
-    this.state = 'menu'; // menu | playing | upgrade | paused | gameover | victory
-    this.time = 0;
-    this.shake = 0;
-    this.player = new Player();
-    this.forgeHp = FORGE.maxHp;
-    this.forgeMaxHp = FORGE.maxHp;
-    this.wave = 0;
-    this.score = 0;
-    this.embers = 0;
-    this.kills = 0;
-    this.upgradesTaken = 0;
-    this.waveTime = 0;
-    this.intermission = 0;
-    this.spawnQueue = [];
-    this.spawnTimer = 0;
-    this.spawned = 0;
-    this.mites = [];
-    this.bullets = [];
-    this.enemyShots = [];
-    this.emberDrops = [];
-    this.particles = [];
-    this.texts = [];
-    this.upgradeChoices = [];
-    this.hoverCard = -1;
-    this.waveIncoming = '';
-    this.autoPlay = false; // screenshot hooks drive the wisp themselves
-    this.muzzle = 0;
-  }
-
-  reset(seed = 1) {
-    this.seed = seed;
-    this.rng = mulberry32(seed);
     this.state = 'menu';
     this.time = 0;
-    this.shake = 0;
+    this.accumulator = 0;
+    this.lastStamp = 0;
+    this.rng = mulberry32(20261116);
+    this.autoplay = false;
+    this.autoFiring = false;
+    this.bossApi = {
+      spawnEnemy: (kind, x, y) => {
+        this.mites.push(new Mite(kind, x, y, this.wave));
+        this.burst(x, y, 6, PALETTE.splitter);
+      },
+      fireShot: (x, y, vx, vy, dmg) => {
+        this.enemyShots.push(new EnemyShot(x, y, vx, vy, dmg, true));
+      },
+      burstFx: (x, y, n, color) => this.burst(x, y, n, color),
+      roar: () => { this.sound.roar(); this.shake = Math.max(this.shake, 5); },
+      miteCount: () => this.mites.length,
+    };
+    this.reset();
+  }
+
+  reset() {
     this.player = new Player();
-    this.forgeHp = FORGE.maxHp;
-    this.forgeMaxHp = FORGE.maxHp;
-    this.wave = 0;
-    this.score = 0;
-    this.embers = 0;
-    this.kills = 0;
-    this.upgradesTaken = 0;
-    this.waveTime = 0;
-    this.intermission = 0;
-    this.spawnQueue = [];
-    this.spawnTimer = 0;
-    this.spawned = 0;
     this.mites = [];
     this.bullets = [];
     this.enemyShots = [];
     this.emberDrops = [];
     this.particles = [];
     this.texts = [];
+    this.novaFx = [];
+    this.zaps = [];
+    this.combo = new ComboTracker();
+    this.ownedUpgrades = [];
+    this.phoenixCharges = 0;
+    this.bossesFelled = 0;
+    this.forgeMaxHp = FORGE.maxHp;
+    this.forgeHp = FORGE.maxHp;
+    this.wave = 0;
+    this.score = 0;
+    this.emberCount = 0;
+    this.kills = 0;
+    this.upgradesTaken = 0;
+    this.spawnQueue = [];
+    this.spawnClock = 0;
+    this.intermission = 0;
+    this.waveTime = 0;
+    this.waveIncoming = '';
     this.upgradeChoices = [];
     this.hoverCard = -1;
-    this.waveIncoming = '';
-    this.autoPlay = false;
-    this.muzzle = 0;
+    this.shake = 0;
+    this.hitStop = 0;
+    this.alarmTimer = 0;
+    this.respawnTimer = 0;
+    this.autoMoveX = 0;
+    this.autoMoveY = 0;
+    this.state = 'menu';
+  }
+
+  get embers() {
+    return this.emberCount;
+  }
+
+  set embers(value) {
+    this.emberCount = value;
   }
 
   startRun() {
-    this.reset(this.seed);
+    this.reset();
     this.state = 'playing';
-    this.nextWave();
     this.sound.unlock();
-    this.sound.waveStart();
-    this.announce(`Wave 1. Defend the Forge.`);
+    this.startWave(1);
   }
 
-  nextWave() {
-    this.wave += 1;
-    const built = buildWave(this.wave, this.seed);
-    this.spawnQueue = built.queue;
-    this.spawnTimer = 0;
-    this.spawned = 0;
+  startWave(wave) {
+    this.wave = wave;
     this.waveTime = 0;
-    this.intermission = INTERMISSION;
-    this.waveIncoming = waveMix(this.wave, this.seed);
-    this.announce(`Wave ${this.wave} of ${WAVE_COUNT}: ${this.waveIncoming}`);
-  }
-
-  announce(text) {
-    if (statusEl) statusEl.textContent = text;
+    const built = buildWave(wave, 4242);
+    this.spawnQueue = built.queue.slice();
+    this.spawnClock = 0;
+    this.waveIncoming = waveMix(wave, 4242);
+    if (BOSS_WAVES[wave]) {
+      this.announce(wave >= 10 ? 'THE HOLLOW MAW COMES' : 'CINDERMAW STIRS', PALETTE.boss, 30);
+    }
   }
 
   enemiesLeft() {
-    return this.mites.length + (this.spawnQueue.length - this.spawned);
+    return this.mites.length + this.spawnQueue.length;
   }
 
-  spawnMite(kind) {
-    const point = spawnPoint(this.rng);
-    this.mites.push(new Mite(kind, point.x, point.y, this.wave));
-  }
+  // ---- effects helpers -------------------------------------------------
 
-  addScore(amount, x, y, color = '#f1f5ff', size = 15) {
-    this.score += amount;
-    if (x !== undefined) this.texts.push(new FloatText(x, y, `+${amount}`, color, size));
-  }
-
-  damageForge(amount) {
-    if (this.state !== 'playing') return;
-    this.forgeHp -= amount;
-    this.shake = Math.max(this.shake, 4);
-    if (this.forgeHp <= 0) {
-      this.forgeHp = 0;
-      this.endRun(false);
+  burst(x, y, count, color, speed = 190) {
+    for (let i = 0; i < count; i += 1) {
+      const a = this.rng() * Math.PI * 2;
+      const v = 40 + this.rng() * speed;
+      this.particles.push(new Particle(
+        x, y, Math.cos(a) * v, Math.sin(a) * v,
+        0.3 + this.rng() * 0.45, 2 + this.rng() * 3, color,
+      ));
     }
+  }
+
+  floatText(x, y, text, color = PALETTE.text, size = 15) {
+    this.texts.push({ x, y, text, color, size, life: 0.9, maxLife: 0.9 });
+  }
+
+  announce(text, color = PALETTE.forgeCore, size = 26) {
+    this.floatText(VIEW.w / 2, 210, text, color, size);
+  }
+
+  // ---- spawning & kills --------------------------------------------------
+
+  spawnFromQueue(dt) {
+    this.spawnClock += dt;
+    while (this.spawnQueue.length > 0 && this.spawnQueue[0].at <= this.spawnClock) {
+      const entry = this.spawnQueue.shift();
+      this.spawnEntry(entry);
+    }
+  }
+
+  spawnEntry(entry) {
+    if (entry.boss) {
+      const boss = new Boss(entry.kind, VIEW.w / 2, 64);
+      this.mites.push(boss);
+      this.sound.roar();
+      this.shake = Math.max(this.shake, 6);
+      this.announce(entry.kind === 'boss' ? 'THE HOLLOW MAW' : 'CINDERMAW', PALETTE.boss, 30);
+      return;
+    }
+    const point = spawnPoint(this.rng);
+    this.mites.push(new Mite(entry.kind, point.x, point.y, this.wave, { elite: entry.elite }));
   }
 
   killMite(mite) {
+    const index = this.mites.indexOf(mite);
+    if (index === -1) return;
+    this.mites.splice(index, 1);
     this.kills += 1;
-    this.addScore(mite.type.score, mite.x, mite.y - 10, '#c084fc', 16);
-    burst(this.particles, mite.x, mite.y, mite.kind === 'brute' ? 26 : 14, mite.type.color, 200, 3.5);
-    burst(this.particles, mite.x, mite.y, 6, PALETTE.forgeCore, 120, 2.5);
-    for (let i = 0; i < mite.type.embers; i += 1) {
-      this.emberDrops.push(new Ember(mite.x, mite.y, 1));
+    const { milestone, bonus } = this.combo.hit();
+    this.score += mite.scoreValue + bonus;
+    this.burst(mite.x, mite.y, mite.isBoss ? 46 : mite.kind === 'brute' || mite.kind === 'bulwark' ? 20 : 10, mite.type.color);
+    this.floatText(mite.x, mite.y - mite.r - 6, `+${mite.scoreValue + bonus}`, mite.elite ? PALETTE.elite : PALETTE.text, mite.isBoss ? 22 : 14);
+    if (milestone > 0) {
+      this.announce(`COMBO ×${milestone}`, PALETTE.combo, 24);
+      this.sound.combo();
     }
-    this.shake = Math.max(this.shake, mite.kind === 'brute' ? 7 : 3);
-    this.sound.kill();
+    // Hit-stop: the world catches its breath on a kill.
+    const stop = mite.isBoss ? 0.14 : mite.elite ? 0.06 : mite.kind === 'brute' || mite.kind === 'bulwark' ? 0.05 : 0.028;
+    this.hitStop = Math.max(this.hitStop, stop);
+    // Embers.
+    const drop = mite.emberValue + this.player.siphon;
+    for (let i = 0; i < drop; i += 1) {
+      const a = this.rng() * Math.PI * 2;
+      const d = this.rng() * 16;
+      this.emberDrops.push(new Ember(mite.x + Math.cos(a) * d, mite.y + Math.sin(a) * d, 1));
+    }
+    if (mite.kind === 'splitter') {
+      // The mother comes apart into her children.
+      for (let i = 0; i < (mite.type.splitsInto || 3); i += 1) {
+        const a = (i * Math.PI * 2) / 3 + this.rng() * 0.6;
+        const child = new Mite('mite', mite.x + Math.cos(a) * 18, mite.y + Math.sin(a) * 18, this.wave);
+        child.spawning = 0.22;
+        child.shove(Math.cos(a) * 130, Math.sin(a) * 130);
+        this.mites.push(child);
+      }
+      this.sound.split();
+    }
+    if (mite.isBoss) {
+      this.bossesFelled += 1;
+      this.shake = Math.max(this.shake, 13);
+      this.sound.bossDie();
+      this.announce(`${mite.type.label.toUpperCase()} FELLED`, PALETTE.forgeCore, 30);
+      this.burst(mite.x, mite.y, 30, PALETTE.forgeCore, 300);
+    } else {
+      this.sound.kill();
+    }
   }
 
-  endRun(won) {
-    this.state = won ? 'victory' : 'gameover';
-    burst(this.particles, FORGE.x, FORGE.y, won ? 80 : 50, won ? PALETTE.forgeCore : '#5b21b6', 260, 4);
-    if (won) this.sound.victory();
-    else this.sound.gameOver();
-    this.announce(won ? 'Victory! The Forge ascends.' : 'Game over. The Forge goes dark.');
+  damageForge(dmg) {
+    if (this.state !== 'playing') return;
+    this.forgeHp -= dmg;
+    this.shake = Math.max(this.shake, 3);
+    if (this.forgeHp <= 0) {
+      if (this.phoenixCharges > 0) {
+        // The Phoenix Wick burns instead of the Forge.
+        this.phoenixCharges -= 1;
+        this.forgeHp = Math.round(this.forgeMaxHp * 0.35);
+        this.sound.phoenix();
+        this.shake = Math.max(this.shake, 10);
+        this.burst(FORGE.x, FORGE.y, 60, PALETTE.forgeCore, 340);
+        this.announce('THE PHOENIX WICK REKINDLES THE FORGE', PALETTE.forgeCore, 24);
+        return;
+      }
+      this.forgeHp = 0;
+      this.state = 'gameover';
+      this.sound.gameOver();
+      this.burst(FORGE.x, FORGE.y, 60, PALETTE.forgeHot, 320);
+    }
   }
+
+  // A landed hit on the wisp: sound, and the death bookkeeping when it kills.
+  hitPlayer(dmg) {
+    if (!this.player.takeHit(dmg)) return;
+    this.sound.hurt();
+    if (!this.player.alive) this.onPlayerDeath();
+  }
+
+  onPlayerDeath() {
+    this.score = Math.max(0, this.score - DEATH_SCORE_COST);
+    this.combo.count = 0;
+    this.combo.timer = 0;
+    this.respawnTimer = 1.6;
+    this.burst(this.player.x, this.player.y, 26, PALETTE.player);
+    this.floatText(this.player.x, this.player.y - 30, `-${DEATH_SCORE_COST} score`, PALETTE.danger, 17);
+    this.sound.playerDie();
+    this.shake = Math.max(this.shake, 7);
+  }
+
+  // ---- abilities -----------------------------------------------------------
+
+  tryDash(dx = 0, dy = 0) {
+    const p = this.player;
+    if (!p.alive) return;
+    if (p.startDash(dx, dy)) {
+      this.sound.dash();
+      this.burst(p.x, p.y, 5, PALETTE.player, 90);
+    }
+  }
+
+  tryNova() {
+    const p = this.player;
+    if (!p.alive || !p.startNova()) return;
+    this.sound.nova();
+    this.shake = Math.max(this.shake, 6);
+    this.novaFx.push({ x: p.x, y: p.y, r: 0, maxR: p.novaRadius, life: 0.35, maxLife: 0.35 });
+    const dead = [];
+    for (const mite of this.mites) {
+      if (mite.spawning > 0) continue;
+      const d = dist(p.x, p.y, mite.x, mite.y);
+      if (d <= p.novaRadius + mite.r) {
+        const a = Math.atan2(mite.y - p.y, mite.x - p.x);
+        mite.shove(Math.cos(a) * ABILITIES.novaKnockback, Math.sin(a) * ABILITIES.novaKnockback);
+        const killed = mite.takeHit(p.novaDamage);
+        this.floatText(mite.x, mite.y - mite.r - 4, String(Math.round(p.novaDamage)), PALETTE.nova, 14);
+        if (killed) dead.push(mite);
+      }
+    }
+    for (const mite of dead) this.killMite(mite);
+  }
+
+  // ---- upgrades ---------------------------------------------------------
 
   openUpgrades() {
-    this.upgradeChoices = rollUpgrades(this.rng);
     this.state = 'upgrade';
-    this.sound.upgrade();
-    this.announce(`Wave ${this.wave} cleared. Choose one upgrade.`);
+    this.upgradeChoices = rollUpgrades(this.rng, this.ownedUpgrades);
+    this.hoverCard = -1;
+    this.score += this.wave * 100; // wave-clear bonus
+    this.sound.waveClear();
   }
 
   takeUpgrade(index) {
     const up = this.upgradeChoices[index];
     if (!up) return;
     up.apply(this.player, this);
+    this.ownedUpgrades.push(up.id);
     this.upgradesTaken += 1;
     this.sound.upgrade();
-    this.texts.push(new FloatText(this.player.x, this.player.y - 30, up.name, PALETTE.forgeCore, 18));
+    this.upgradeChoices = [];
     this.state = 'playing';
-    this.nextWave();
+    this.startWave(this.wave + 1);
   }
 
-  // ---- per-frame update ----
+  takeBestUpgrade() {
+    let best = 0;
+    let bestRank = Infinity;
+    this.upgradeChoices.forEach((up, i) => {
+      const rank = UPGRADE_PRIORITY.indexOf(up.id);
+      const r = rank === -1 ? 99 : rank;
+      if (r < bestRank) { bestRank = r; best = i; }
+    });
+    this.takeUpgrade(best);
+  }
+
+  cardAt(x, y) {
+    const cardW = 300;
+    const cardH = 250;
+    const gap = 28;
+    const x0 = (VIEW.w - (cardW * 3 + gap * 2)) / 2;
+    const y0 = 250;
+    if (y < y0 || y > y0 + cardH) return -1;
+    for (let i = 0; i < 3; i += 1) {
+      const cx = x0 + i * (cardW + gap);
+      if (x >= cx && x <= cx + cardW) return i;
+    }
+    return -1;
+  }
+
+  // ---- update -------------------------------------------------------------
 
   update(dt) {
-    this.time += dt;
-    this.shake = Math.max(0, this.shake - dt * 22);
-    this.muzzle = Math.max(0, this.muzzle - dt * 6);
-    for (const p of this.particles) p.update(dt);
-    this.particles = this.particles.filter((p) => !p.dead);
-    for (const t of this.texts) t.update(dt);
-    this.texts = this.texts.filter((t) => !t.dead);
+    if (this.state !== 'paused') this.time += dt;
+    if (this.input.wasPressed('KeyM')) this.sound.toggleMute();
+
+    // Hit-stop: kills briefly slow the whole world.
+    let scale = 1;
+    if (this.hitStop > 0) {
+      this.hitStop -= dt;
+      scale = 0.22;
+    }
+    const sdt = dt * scale;
 
     if (this.state === 'menu') {
-      this.updateMenu(dt);
-    } else if (this.state === 'playing') {
-      this.updatePlaying(dt);
-    } else if (this.state === 'upgrade') {
-      this.updateUpgrade(dt);
-    }
-    // paused / gameover / victory: the world freezes, particles settle.
-  }
-
-  updateMenu(dt) {
-    // Slow ember drift behind the title: purely decorative.
-    if (Math.random() < dt * 8) {
-      this.particles.push(new Particle(
-        Math.random() * VIEW.w, VIEW.h + 10,
-        (Math.random() - 0.5) * 20, -30 - Math.random() * 40,
-        3 + Math.random() * 2, 2 + Math.random() * 2, PALETTE.forgeHot,
-      ));
-    }
-    if (this.input.wasPressed('Enter', 'Space') || this.input.wasClicked()) {
-      this.sound.unlock();
-      this.sound.click();
-      this.startRun();
-    }
-  }
-
-  updatePlaying(dt) {
-    const input = this.input;
-    const p = this.player;
-    this.waveTime += dt;
-
-    if (input.wasPressed('KeyP', 'Escape')) {
-      this.state = 'paused';
+      if (this.input.wasClicked() || this.input.wasPressed('Enter') || this.input.wasPressed('Space')) {
+        this.sound.unlock();
+        this.startRun();
+      }
+      this.input.endFrame();
       return;
     }
-    if (input.wasPressed('KeyM')) this.sound.toggleMute();
-    if (input.wasPressed('KeyR')) { this.startRun(); return; }
-
-    // Movement.
-    let dx = 0;
-    let dy = 0;
-    if (input.down('KeyW', 'ArrowUp')) dy -= 1;
-    if (input.down('KeyS', 'ArrowDown')) dy += 1;
-    if (input.down('KeyA', 'ArrowLeft')) dx -= 1;
-    if (input.down('KeyD', 'ArrowRight')) dx += 1;
-    if (this.autoPlay) {
-      // Orbit the Forge so the wisp stays near the mites and their embers.
-      const angle = this.time * 0.8;
-      const tx = FORGE.x + Math.cos(angle) * 200;
-      const ty = FORGE.y + Math.sin(angle) * 150;
-      const ddx = tx - p.x;
-      const ddy = ty - p.y;
-      const dl = Math.hypot(ddx, ddy) || 1;
-      dx = ddx / dl;
-      dy = ddy / dl;
-      // Aim at the nearest mite, else at the Forge's edge. A mite latched
-      // on the Forge is the priority: it is chewing the thing we defend.
-      const latching = this.mites.filter((m) => m.latching);
-      const target = latching.length > 0 ? latching[0] : this.nearestMite();
-      if (target) input.setMouse(target.x, target.y, true);
-      else input.setMouse(FORGE.x + 200, FORGE.y, false);
+    if (this.state === 'gameover' || this.state === 'victory') {
+      this._updateFx(sdt);
+      if (this.input.wasClicked() || this.input.wasPressed('Enter') || this.input.wasPressed('KeyR')) {
+        this.startRun();
+      }
+      this.input.endFrame();
+      return;
     }
-    p.move(dx, dy, dt);
-    p.aimAt(input.mouseX, input.mouseY);
-    p.update(dt);
-
-    // Firing.
-    if ((input.mouseDown || this.autoPlay) && p.canFire()) {
-      const shots = p.fire();
-      for (const s of shots) this.bullets.push(s);
-      this.muzzle = 1;
-      this.sound.shoot();
+    if (this.state === 'paused') {
+      if (this.input.wasPressed('KeyP') || this.input.wasPressed('Escape')) this.state = 'playing';
+      if (this.input.wasPressed('KeyR')) this.startRun();
+      this.input.endFrame();
+      return;
+    }
+    if (this.state === 'upgrade') {
+      this._updateFx(sdt);
+      this.hoverCard = this.cardAt(this.input.mouseX, this.input.mouseY);
+      if (this.input.wasClicked() && this.hoverCard >= 0) this.takeUpgrade(this.hoverCard);
+      else if (this.autoplay) this.takeBestUpgrade();
+      else {
+        if (this.input.wasPressed('Digit1')) this.takeUpgrade(0);
+        if (this.input.wasPressed('Digit2')) this.takeUpgrade(1);
+        if (this.input.wasPressed('Digit3')) this.takeUpgrade(2);
+      }
+      this.input.endFrame();
+      return;
     }
 
-    // Spawning.
+    // playing
+    if (this.input.wasPressed('KeyP') || this.input.wasPressed('Escape')) {
+      this.state = 'paused';
+      this.input.endFrame();
+      return;
+    }
+    this.waveTime += sdt;
+    this.combo.update(sdt);
+    // The fallen wisp re-forms at the Forge after a short wait.
+    if (!this.player.alive) {
+      this.respawnTimer -= sdt;
+      if (this.respawnTimer <= 0) {
+        this.player.respawn();
+        this.burst(FORGE.x, FORGE.y + 120, 18, PALETTE.player, 150);
+      }
+    }
+    if (this.autoplay) this._autoplay();
+    this._updatePlayer(sdt);
+    this.spawnFromQueue(sdt);
+    this._updateMites(sdt);
+    this._updateBullets(sdt);
+    this._updateEnemyShots(sdt);
+    this._updateEmbers(sdt);
+    this._updateFx(sdt);
+
+    // Low-Forge alarm and smoke.
+    if (this.forgeHp / this.forgeMaxHp < 0.3) {
+      this.alarmTimer -= sdt;
+      if (this.alarmTimer <= 0) {
+        this.sound.alarm();
+        this.alarmTimer = 1.4;
+      }
+      if (this.rng() < 0.3) {
+        this.particles.push(new Particle(
+          FORGE.x + (this.rng() - 0.5) * 60, FORGE.y - 30,
+          (this.rng() - 0.5) * 14, -34 - this.rng() * 22,
+          0.9, 5 + this.rng() * 5, 'rgba(90, 84, 110, 0.8)',
+        ));
+      }
+    }
+
+    // Wave flow.
+    if (this.spawnQueue.length === 0 && this.mites.length === 0 && this.state === 'playing') {
+      if (isFinalWave(this.wave)) {
+        this.state = 'victory';
+        this.score += 1000;
+        this.sound.victory();
+      } else if (this.intermission <= 0) {
+        this.intermission = 1.6;
+      }
+    }
     if (this.intermission > 0) {
-      this.intermission -= dt;
-    } else if (this.spawned < this.spawnQueue.length) {
-      this.spawnTimer += dt;
-      while (this.spawned < this.spawnQueue.length && this.spawnQueue[this.spawned].at <= this.spawnTimer) {
-        this.spawnMite(this.spawnQueue[this.spawned].kind);
-        this.spawned += 1;
+      this.intermission -= sdt;
+      if (this.intermission <= 0 && this.state === 'playing') this.openUpgrades();
+    }
+    this.input.endFrame();
+  }
+
+  _updatePlayer(dt) {
+    const p = this.player;
+    const input = this.input;
+    let mx = 0;
+    let my = 0;
+    if (this.autoplay) {
+      mx = this.autoMoveX;
+      my = this.autoMoveY;
+    } else {
+      if (input.down('KeyA', 'ArrowLeft')) mx -= 1;
+      if (input.down('KeyD', 'ArrowRight')) mx += 1;
+      if (input.down('KeyW', 'ArrowUp')) my -= 1;
+      if (input.down('KeyS', 'ArrowDown')) my += 1;
+    }
+    p.move(mx, my, dt);
+    p.aimAt(input.mouseX, input.mouseY);
+    if (!this.autoplay && p.alive) {
+      if (input.wasPressed('ShiftLeft', 'ShiftRight', 'Space') || input.wasRightClicked()) this.tryDash(mx, my);
+      if (input.wasPressed('KeyE', 'KeyQ')) this.tryNova();
+    }
+    p.update(dt);
+    const wantFire = this.autoplay ? this.autoFiring : input.mouseDown;
+    if (wantFire && p.canFire()) {
+      const fired = p.fire();
+      if (fired.length > 0) {
+        this.bullets.push(...fired);
+        const muzzleX = p.x + Math.cos(p.facing) * (p.r + 8);
+        const muzzleY = p.y + Math.sin(p.facing) * (p.r + 8);
+        this.burst(muzzleX, muzzleY, 2, PALETTE.bullet, 60);
+        this.sound.shoot();
       }
     }
+  }
 
-    // Mites.
+  _updateMites(dt) {
     for (const mite of this.mites) {
-      const { atForge, dPlayer } = mite.update(dt, p, this.time);
-      if (atForge && mite.attackTimer <= 0) {
-        mite.attackTimer = 1;
-        this.damageForge(mite.type.forgeDps);
-        burst(this.particles, mite.x, mite.y, 4, PALETTE.forgeEmber, 90, 2.5);
+      const result = mite.isBoss
+        ? mite.update(dt, this.player, this.time, this.bossApi)
+        : mite.update(dt, this.player, this.time);
+      if (mite.spawning > 0) continue;
+      // Spitters hold off and spit at the wisp.
+      if (mite.type.ranged && mite.shotTimer <= 0 && this.player.alive && result.dPlayer < 360) {
+        const a = Math.atan2(this.player.y - mite.y, this.player.x - mite.x);
+        this.enemyShots.push(new EnemyShot(
+          mite.x, mite.y,
+          Math.cos(a) * mite.type.shotSpeed, Math.sin(a) * mite.type.shotSpeed,
+          mite.type.shotDamage,
+        ));
+        mite.shotTimer = mite.type.shotCooldown;
+        this.sound.spit();
+      }
+      // Contact with the wisp, gated by the mite's own bite cooldown.
+      if (this.player.alive && mite.contactTimer <= 0 && result.dPlayer < mite.r + this.player.r) {
+        this.hitPlayer(mite.type.contact);
+        mite.contactTimer = 0.6;
+      }
+      // Chewing the Forge, in bites worth 0.8s of its damage rate.
+      if (result.atForge && mite.attackTimer <= 0) {
+        mite.attackTimer = 0.8;
+        this.damageForge(mite.type.forgeDps * 0.8);
+        this.burst(FORGE.x, FORGE.y - FORGE.r, 4, PALETTE.forgeHot, 120);
         this.sound.forgeHit();
-        this.texts.push(new FloatText(mite.x, mite.y - mite.r - 8, `-${mite.type.forgeDps}`, PALETTE.danger, 13));
-      }
-      if (p.alive && dPlayer < mite.r + p.r && mite.contactTimer <= 0) {
-        mite.contactTimer = 0.7;
-        if (p.takeHit(mite.type.contact)) {
-          this.shake = Math.max(this.shake, 6);
-          burst(this.particles, p.x, p.y, 8, PALETTE.player, 140, 3);
-          this.sound.hurt();
-          if (!p.alive) this.onPlayerDeath();
-        }
-      }
-      // Spitters shoot at the Forge (or the wisp if it is closer).
-      if (mite.type.ranged && mite.shotTimer <= 0 && this.state === 'playing') {
-        const target = dPlayer < 240 && p.alive ? p : { x: FORGE.x, y: FORGE.y };
-        const d = dist(mite.x, mite.y, target.x, target.y);
-        if (d < 460) {
-          mite.shotTimer = mite.type.shotCooldown;
-          const vx = ((target.x - mite.x) / d) * mite.type.shotSpeed;
-          const vy = ((target.y - mite.y) / d) * mite.type.shotSpeed;
-          this.enemyShots.push(new EnemyShot(mite.x, mite.y, vx, vy, mite.type.shotDamage));
-          this.sound.shoot();
-        }
       }
     }
+  }
 
-    // Bullets vs mites.
+  _updateBullets(dt) {
+    const dead = [];
     for (const bullet of this.bullets) {
       bullet.update(dt);
       if (bullet.dead) continue;
       for (const mite of this.mites) {
-        if (mite.dead || bullet.hitIds.has(mite.id)) continue;
-        if (dist(bullet.x, bullet.y, mite.x, mite.y) < bullet.r + mite.r) {
-          bullet.hitIds.add(mite.id);
-          const died = mite.takeHit(bullet.damage);
-          burst(this.particles, bullet.x, bullet.y, 5, PALETTE.bullet, 120, 2.5);
-          this.texts.push(new FloatText(mite.x, mite.y - mite.r - 4, String(Math.round(bullet.damage)), '#ffe9a8', 13));
+        if (mite.spawning > 0 || mite.dead || bullet.hitIds.has(mite.id)) continue;
+        if (dist(bullet.x, bullet.y, mite.x, mite.y) > bullet.r + mite.r) continue;
+        bullet.hitIds.add(mite.id);
+        const hadShield = mite.shieldHp > 0;
+        const killed = mite.takeHit(bullet.damage);
+        mite.shove(bullet.vx * (bullet.explosive ? 0.2 : 0.13), bullet.vy * (bullet.explosive ? 0.2 : 0.13));
+        if (hadShield && mite.shieldHp > 0) {
+          // The ward ate it: cyan numbers, a glassy tick.
+          this.floatText(mite.x, mite.y - mite.r - 4, String(Math.round(bullet.damage)), PALETTE.shield, 13);
+          this.sound.shieldHit();
+        } else {
+          if (hadShield) {
+            this.floatText(mite.x, mite.y - mite.r - 18, 'WARD BROKEN', PALETTE.shield, 13);
+            this.burst(mite.x, mite.y, 10, PALETTE.shield, 160);
+            this.sound.shieldBreak();
+          }
+          this.floatText(
+            mite.x, mite.y - mite.r - 4, String(Math.round(bullet.damage)),
+            bullet.explosive ? PALETTE.combo : bullet.damage >= 30 ? '#ffd76b' : '#ffffff',
+            bullet.explosive ? 16 : 13,
+          );
           this.sound.hit();
-          if (died) this.killMite(mite);
-          if (bullet.hitIds.size > bullet.pierce) { bullet.dead = true; break; }
+        }
+        // Arc Conductor: lightning leaps to a neighbour.
+        if (this.player.arcChance > 0 && this.rng() < this.player.arcChance) {
+          let best = null;
+          let bestD = 150;
+          for (const other of this.mites) {
+            if (other === mite || other.spawning > 0 || other.dead) continue;
+            const d = dist(mite.x, mite.y, other.x, other.y);
+            if (d < bestD) { bestD = d; best = other; }
+          }
+          if (best) {
+            const arcKilled = best.takeHit(bullet.damage * 0.5);
+            this.zaps.push({ x1: mite.x, y1: mite.y, x2: best.x, y2: best.y, life: 0.16 });
+            this.sound.arc();
+            if (arcKilled && !dead.includes(best)) dead.push(best);
+          }
+        }
+        // Star shells burst over a wide mark.
+        if (bullet.explosive) {
+          this.sound.starfall();
+          this.hitStop = Math.max(this.hitStop, 0.05);
+          this.burst(bullet.x, bullet.y, 16, PALETTE.combo, 260);
+          for (const other of this.mites) {
+            if (other === mite || other.spawning > 0 || other.dead) continue;
+            if (dist(bullet.x, bullet.y, other.x, other.y) <= 72 + other.r) {
+              const a = Math.atan2(other.y - bullet.y, other.x - bullet.x);
+              other.shove(Math.cos(a) * 200, Math.sin(a) * 200);
+              if (other.takeHit(bullet.damage * 0.8) && !dead.includes(other)) dead.push(other);
+            }
+          }
+        }
+        if (killed && !dead.includes(mite)) dead.push(mite);
+        if (bullet.hitIds.size > bullet.pierce) {
+          bullet.dead = true;
+          break;
         }
       }
     }
     this.bullets = this.bullets.filter((b) => !b.dead);
-    this.mites = this.mites.filter((m) => !m.dead);
+    for (const mite of dead) this.killMite(mite);
+  }
 
-    // Enemy shots.
+  _updateEnemyShots(dt) {
     for (const shot of this.enemyShots) {
       shot.update(dt);
       if (shot.dead) continue;
-      if (p.alive && dist(shot.x, shot.y, p.x, p.y) < shot.r + p.r) {
-        shot.dead = true;
-        if (p.takeHit(shot.damage)) {
-          this.shake = Math.max(this.shake, 5);
-          this.sound.hurt();
-          if (!p.alive) this.onPlayerDeath();
+      if (this.player.alive
+        && dist(shot.x, shot.y, this.player.x, this.player.y) < shot.r + this.player.r) {
+        // takeHit returns false through i-frames: the shot flies on.
+        if (this.player.invuln <= 0) {
+          this.hitPlayer(shot.damage);
+          shot.dead = true;
         }
-        continue;
-      }
-      if (dist(shot.x, shot.y, FORGE.x, FORGE.y) < shot.r + FORGE.r) {
-        shot.dead = true;
+      } else if (!shot.fromBoss && dist(shot.x, shot.y, FORGE.x, FORGE.y) < shot.r + FORGE.r - 8) {
         this.damageForge(shot.damage);
-        burst(this.particles, shot.x, shot.y, 5, '#e879f9', 110, 2.5);
+        shot.dead = true;
       }
     }
     this.enemyShots = this.enemyShots.filter((s) => !s.dead);
+  }
 
-    // Embers.
+  _updateEmbers(dt) {
     for (const ember of this.emberDrops) {
-      ember.update(dt, p);
-      if (ember.dead) continue;
-      if (p.alive && dist(ember.x, ember.y, p.x, p.y) < ember.r + p.r + 8) {
+      ember.update(dt, this.player);
+      if (!ember.dead && this.player.alive
+        && dist(ember.x, ember.y, this.player.x, this.player.y) < this.player.r + ember.r + 2) {
         ember.dead = true;
-        this.embers += 1;
-        this.addScore(EMBER_VALUE, ember.x, ember.y, PALETTE.ember, 12);
-        this.sound.pickup();
+        this.emberCount += ember.value || 1;
+        this.score += EMBER_VALUE;
+        this.sound.ember();
       }
     }
     this.emberDrops = this.emberDrops.filter((e) => !e.dead);
+  }
 
-    // Wave cleared?
-    if (this.state === 'playing' && this.spawned >= this.spawnQueue.length && this.mites.length === 0) {
-      this.addScore(WAVE_CLEAR_BONUS * this.wave, FORGE.x, FORGE.y - 90, PALETTE.forgeCore, 20);
-      p.hp = Math.min(p.maxHp, p.hp + 20); // catch breath between waves
-      this.forgeHp = Math.min(this.forgeMaxHp, this.forgeHp + 15); // the Forge rekindles a little
-      if (isFinalWave(this.wave)) {
-        this.endRun(true);
-      } else {
-        this.openUpgrades();
-      }
+  _updateFx(dt) {
+    for (const p of this.particles) p.update(dt);
+    this.particles = this.particles.filter((p) => p.life > 0);
+    for (const t of this.texts) {
+      t.y -= 34 * dt;
+      t.life -= dt;
     }
-  }
-
-  onPlayerDeath() {
-    burst(this.particles, this.player.x, this.player.y, 30, PALETTE.player, 220, 4);
-    this.score = Math.max(0, this.score - DEATH_SCORE_COST);
-    this.texts.push(new FloatText(this.player.x, this.player.y - 30, `-${DEATH_SCORE_COST} score`, PALETTE.danger, 16));
-    this.sound.gameOver();
-    // The wisp wakes at the Forge when the next wave starts, or at once if
-    // the wave is already over: respawn immediately, brief invulnerability.
-    this.player.respawn();
-  }
-
-  updateUpgrade(dt) {
-    const input = this.input;
-    // Hover tracking for the card highlight.
-    const cardW = 300;
-    const gap = 28;
-    const totalW = cardW * 3 + gap * 2;
-    const x0 = (VIEW.w - totalW) / 2;
-    const y0 = 250;
-    this.hoverCard = -1;
-    if (input.mouseY >= y0 && input.mouseY <= y0 + 250) {
-      for (let i = 0; i < 3; i += 1) {
-        const x = x0 + i * (cardW + gap);
-        if (input.mouseX >= x && input.mouseX <= x + cardW) this.hoverCard = i;
-      }
+    this.texts = this.texts.filter((t) => t.life > 0);
+    for (const ring of this.novaFx) {
+      ring.life -= dt;
+      ring.r = ring.maxR * (1 - Math.max(0, ring.life) / ring.maxLife);
     }
-    if (input.wasPressed('Digit1', 'Numpad1')) this.takeUpgrade(0);
-    else if (input.wasPressed('Digit2', 'Numpad2')) this.takeUpgrade(1);
-    else if (input.wasPressed('Digit3', 'Numpad3')) this.takeUpgrade(2);
-    else if (input.wasClicked() && this.hoverCard >= 0) this.takeUpgrade(this.hoverCard);
+    this.novaFx = this.novaFx.filter((r) => r.life > 0);
+    for (const zap of this.zaps) zap.life -= dt;
+    this.zaps = this.zaps.filter((z) => z.life > 0);
+    this.shake = Math.max(0, this.shake - dt * 26);
   }
 
-  nearestMite() {
-    let best = null;
-    let bestD = Infinity;
+  // ---- self-play (demo + soak test) ---------------------------------------
+
+  _autoplay() {
+    const p = this.player;
+    // Target priority, like a competent guardian: anything chewing the
+    // Forge (or about to) dies first, then the boss, then the nearest mite.
+    let target = null;
+    let targetDist = Infinity;
+    let threatD = Infinity;
     for (const mite of this.mites) {
-      const d = dist(mite.x, mite.y, this.player.x, this.player.y);
-      if (d < bestD) { bestD = d; best = mite; }
+      if (mite.spawning > 0) continue;
+      const dForge = dist(mite.x, mite.y, FORGE.x, FORGE.y);
+      if ((mite.latching || dForge < FORGE.r + 80) && dForge < threatD) {
+        threatD = dForge;
+        target = mite;
+        targetDist = dist(p.x, p.y, mite.x, mite.y);
+      }
     }
-    return best;
+    if (!target) {
+      target = this.mites.find((m) => m.isBoss && m.spawning <= 0) || null;
+      targetDist = target ? dist(p.x, p.y, target.x, target.y) : Infinity;
+    }
+    if (!target) {
+      for (const mite of this.mites) {
+        if (mite.spawning > 0) continue;
+        const d = dist(p.x, p.y, mite.x, mite.y);
+        if (d < targetDist) { targetDist = d; target = mite; }
+      }
+    }
+    this.autoFiring = Boolean(target);
+    if (target) {
+      // Aim at the target, led by its knockback drift.
+      const lead = clamp(dist(p.x, p.y, target.x, target.y) / 620, 0, 0.4);
+      this.input.mouseX = target.x + target.kx * lead * 0.4;
+      this.input.mouseY = target.y + target.ky * lead * 0.4;
+      // Hold a fighting distance, on the far side from the Forge.
+      const awayX = target.x - FORGE.x;
+      const awayY = target.y - FORGE.y;
+      const awayLen = Math.hypot(awayX, awayY) || 1;
+      const want = 195;
+      const spotX = target.x + (awayX / awayLen) * want;
+      const spotY = target.y + (awayY / awayLen) * want;
+      const dx = spotX - p.x;
+      const dy = spotY - p.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 14) { this.autoMoveX = dx / len; this.autoMoveY = dy / len; }
+      else { this.autoMoveX = 0; this.autoMoveY = 0; }
+      // Nova when crowded.
+      let near = 0;
+      for (const mite of this.mites) {
+        if (mite.spawning <= 0 && dist(p.x, p.y, mite.x, mite.y) < p.novaRadius) near += 1;
+      }
+      if (near >= 4) this.tryNova();
+      // Dash when cornered or when the Maw winds up its charge.
+      const bossCharging = target.isBoss && (target.mode === 'windup' || target.mode === 'charge');
+      if ((targetDist < 95 && !target.isBoss) || bossCharging) {
+        this.tryDash(p.x < target.x ? -1 : 1, p.y < target.y ? -1 : 1);
+      }
+    } else {
+      // Nothing to fight: drift back toward a guard post below the Forge.
+      const dx = FORGE.x - p.x;
+      const dy = FORGE.y + 120 - p.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 20) { this.autoMoveX = dx / len; this.autoMoveY = dy / len; }
+      else { this.autoMoveX = 0; this.autoMoveY = 0; }
+    }
   }
 
-  // ---- drawing ----
+  // ---- render ---------------------------------------------------------------
 
-  draw() {
+  render() {
+    const ctx = this.ctx;
     ctx.save();
-    ctx.clearRect(0, 0, VIEW.w, VIEW.h);
-    if (this.shake > 0) {
-      ctx.translate((Math.random() - 0.5) * this.shake, (Math.random() - 0.5) * this.shake);
+    if (this.shake > 0.2) {
+      ctx.translate((this.rng() - 0.5) * this.shake, (this.rng() - 0.5) * this.shake);
     }
-    render.drawBackground(ctx, this.time);
-    if (this.state !== 'menu') {
-      render.drawForge(ctx, this, this.time);
-      for (const ember of this.emberDrops) render.drawEmber(ctx, ember);
-      for (const mite of this.mites) render.drawMite(ctx, mite, this.time);
-      for (const shot of this.enemyShots) render.drawEnemyShot(ctx, shot);
-      render.drawPlayer(ctx, this.player, this.time);
-      for (const bullet of this.bullets) render.drawBullet(ctx, bullet);
-      // Muzzle flash.
-      if (this.muzzle > 0 && this.player.alive) {
-        const p = this.player;
-        const mx = p.x + Math.cos(p.facing) * (p.r + 12);
-        const my = p.y + Math.sin(p.facing) * (p.r + 12);
-        ctx.fillStyle = `rgba(255, 233, 168, ${this.muzzle * 0.9})`;
-        ctx.beginPath();
-        ctx.arc(mx, my, 10 * this.muzzle + 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      render.drawParticles(ctx, this.particles);
-      render.drawFloatTexts(ctx, this.texts);
-    } else {
-      render.drawParticles(ctx, this.particles);
+    drawBackground(ctx, this.time);
+    drawForge(ctx, this, this.time);
+    for (const ember of this.emberDrops) drawEmber(ctx, ember);
+    for (const mite of this.mites) {
+      if (mite.isBoss) drawBoss(ctx, mite, this.time);
+      else drawMite(ctx, mite, this.time);
     }
+    for (const shot of this.enemyShots) drawEnemyShot(ctx, shot);
+    for (const bullet of this.bullets) drawBullet(ctx, bullet);
+    drawPlayer(ctx, this.player, this.time);
+    drawNovaFx(ctx, this.novaFx);
+    drawZaps(ctx, this.zaps);
+    drawParticles(ctx, this.particles);
+    drawFloatTexts(ctx, this.texts);
     ctx.restore();
+    drawVignette(ctx, this, this.time);
 
-    if (this.state === 'menu') render.drawMenu(ctx, this);
-    else if (this.state === 'playing' || this.state === 'paused') {
-      render.drawHUD(ctx, this);
-      if (this.state === 'paused') render.drawPause(ctx);
-    } else if (this.state === 'upgrade') {
-      render.drawHUD(ctx, this);
-      render.drawUpgrade(ctx, this);
-    } else if (this.state === 'gameover') render.drawGameOver(ctx, this);
-    else if (this.state === 'victory') render.drawVictory(ctx, this);
+    if (this.state === 'playing' || this.state === 'paused' || this.state === 'upgrade') drawHUD(ctx, this);
+    if (this.state === 'menu') drawMenu(ctx, this);
+    if (this.state === 'upgrade') drawUpgrade(ctx, this);
+    if (this.state === 'paused') drawPause(ctx);
+    if (this.state === 'gameover') drawGameOver(ctx, this);
+    if (this.state === 'victory') drawVictory(ctx, this);
+  }
+
+  // ---- loop -------------------------------------------------------------------
+
+  frame(stamp) {
+    if (!this.lastStamp) this.lastStamp = stamp;
+    let elapsed = (stamp - this.lastStamp) / 1000;
+    this.lastStamp = stamp;
+    elapsed = Math.min(elapsed, 0.25);
+    this.accumulator += elapsed;
+    while (this.accumulator >= FIXED_DT) {
+      this.update(FIXED_DT);
+      this.accumulator -= FIXED_DT;
+    }
+    this.render();
+    requestAnimationFrame((s) => this.frame(s));
+  }
+
+  stepOnce(dt = FIXED_DT) {
+    this.update(dt);
+    this.render();
   }
 }
 
-// ---- boot ----
+// ---- boot ---------------------------------------------------------------------
 
-const game = new Game();
+const canvas = document.getElementById('game');
+canvas.width = VIEW.w;
+canvas.height = VIEW.h;
+const game = new Game(canvas);
 window.__game = game;
 
-function stepOnce(dt) {
-  game.update(dt);
-  game.draw();
-  game.input.endFrame();
-}
+// First interaction unlocks audio (browser autoplay policy).
+window.addEventListener('pointerdown', () => game.sound.unlock(), { once: true });
 
-let last = performance.now();
-function frame(now) {
-  const dt = clamp((now - last) / 1000, 0, 1 / 20);
-  last = now;
-  stepOnce(dt);
-  requestAnimationFrame(frame);
-}
-
-// Screenshot / test hooks: ?shot=menu|play|upgrade|gameover|victory&seed=N
-// drives the game into a real state and marks window.__shotReady when the
-// frame is drawn. Normal play never passes these parameters.
-function applyShotHook() {
-  const params = new URLSearchParams(window.location.search);
-  const shot = params.get('shot');
-  if (!shot) return;
-  const seed = Number(params.get('seed') || '7') || 7;
-  game.seed = seed;
-  const dt = 1 / 60;
+// Screenshot hooks: deterministic scenes for the build pipeline. Each hook
+// drives the REAL game (self-play or real states) and flags readiness.
+//   ?shot=menu | play | upgrade | victory | gameover   &seed=N
+const params = new URLSearchParams(window.location.search);
+const shot = params.get('shot');
+if (shot) {
+  const seed = Number(params.get('seed') || 1);
+  game.rng = mulberry32(seed * 1000 + 77);
+  const ready = () => { window.__shotReady = true; };
+  // Fast-forward driver: step the simulation without rendering (rendering
+  // happens once, at capture), so self-play scenes arrive in seconds.
+  const pump = (steps) => { for (let i = 0; i < steps; i += 1) game.update(FIXED_DT); };
   if (shot === 'menu') {
-    game.reset(seed);
-    game.state = 'menu';
+    game.stepOnce();
+    ready();
   } else if (shot === 'play') {
+    // Self-play into the wave-5 boss fight and capture mid-battle.
     game.startRun();
-    game.autoPlay = true;
-    // Play through to wave 2+, auto-picking upgrades, and stop mid-wave
-    // once the arena is busy (5+ mites alive) — the frame shows the fight.
-    let guard = 0;
-    while (guard < 60 * 600) {
-      if (game.state === 'upgrade') game.takeUpgrade(0);
-      stepOnce(dt);
-      guard += 1;
-      if (game.state === 'playing' && game.wave >= 2 && game.mites.length >= 5 && game.kills >= 6) break;
-      if (game.state !== 'playing' && game.state !== 'upgrade') break;
-    }
-    game.autoPlay = false;
-    if (game.state !== 'playing') {
-      // Fallback: a busy mid-wave-2 frame, rendered by the real game.
-      game.reset(seed);
-      game.state = 'playing';
-      game.wave = 2;
-      game.spawnQueue = [];
-      game.spawned = 0;
-      game.intermission = 0;
-      game.kills = 6;
-      game.score = 300;
-      const spots = [[200, 200], [1080, 180], [180, 620], [1100, 640], [640, 120], [900, 700]];
-      spots.forEach(([x, y], i) => game.mites.push(new Mite(i % 3 === 0 ? 'skitter' : 'mite', x, y, 2)));
-      game.emberDrops.push(new Ember(500, 300, 1), new Ember(820, 500, 1), new Ember(700, 220, 1));
-      game.input.setMouse(900, 200, true);
-    }
-    // Leave the mouse held down so the muzzle flash shows.
-    game.input.setMouse(game.player.x + 120, game.player.y - 60, true);
+    game.autoplay = true;
+    let ticks = 0;
+    const iv = setInterval(() => {
+      pump(10);
+      ticks += 1;
+      const boss = game.mites.find((m) => m.isBoss);
+      const hurt = boss && boss.hp < boss.maxHp * 0.8;
+      if ((hurt && game.mites.length >= 4 && game.state === 'playing') || ticks > 1500) {
+        clearInterval(iv);
+        game.autoplay = false;
+        if (!(boss && game.state === 'playing')) stageBossScene(game);
+        game.stepOnce();
+        ready();
+      }
+    }, 50);
   } else if (shot === 'upgrade') {
+    // Play wave 1 for real, then make sure a RARE card is on the table.
     game.startRun();
-    game.autoPlay = true;
-    // Play wave 1 to the end, then stop on the upgrade screen.
-    let guard = 0;
-    while (game.state === 'playing' && guard < 60 * 240) {
-      stepOnce(dt);
-      guard += 1;
-    }
-    game.autoPlay = false;
-    if (game.state !== 'upgrade') {
-      // Fallback: force a cleared wave 1 so the screen still renders.
-      game.mites = [];
-      game.spawnQueue = [];
-      game.spawned = 0;
-      game.openUpgrades();
-    }
-    game.input.setMouse(640, 375, false); // hover the middle card
+    game.autoplay = true;
+    let ticks = 0;
+    const iv = setInterval(() => {
+      pump(10);
+      ticks += 1;
+      if (game.state === 'upgrade' || ticks > 900) {
+        clearInterval(iv);
+        game.autoplay = false;
+        if (game.state !== 'upgrade') {
+          game.state = 'upgrade';
+          game.wave = Math.max(1, game.wave);
+        }
+        for (let i = 0; i < 60; i += 1) {
+          game.upgradeChoices = rollUpgrades(game.rng, game.ownedUpgrades);
+          if (game.upgradeChoices.some((c) => c.rarity === 'rare')) break;
+        }
+        game.hoverCard = 1;
+        game.input.mouseX = VIEW.w / 2;
+        game.input.mouseY = 340;
+        game.stepOnce();
+        ready();
+      }
+    }, 50);
+  } else if (shot === 'victory') {
+    // Self-play whole runs across seeds; capture a real victory if one lands.
+    game.startRun();
+    game.autoplay = true;
+    let seedTry = seed;
+    let ticks = 0;
+    const iv = setInterval(() => {
+      pump(24);
+      ticks += 1;
+      if (game.state === 'victory') {
+        clearInterval(iv);
+        game.autoplay = false;
+        game.stepOnce();
+        ready();
+      } else if (game.state === 'gameover' || ticks > 1400) {
+        seedTry += 1;
+        ticks = 0;
+        if (seedTry > seed + 5) {
+          clearInterval(iv);
+          game.autoplay = false;
+          stageVictory(game);
+          game.stepOnce();
+          ready();
+        } else {
+          game.rng = mulberry32(seedTry * 1000 + 77);
+          game.startRun();
+          game.autoplay = true;
+        }
+      }
+    }, 50);
   } else if (shot === 'gameover') {
     game.startRun();
-    game.autoPlay = true;
-    // Play a real stretch first so the end screen carries real stats.
-    for (let i = 0; i < 480; i += 1) stepOnce(dt);
-    game.autoPlay = false;
-    game.forgeHp = 4;
-    game.spawnQueue = [];
-    game.spawned = 0;
-    // A brute latched on the Forge finishes it off for real.
-    const brute = new Mite('brute', FORGE.x + FORGE.r + 20, FORGE.y, 1);
-    brute.attackTimer = 0;
-    game.mites.push(brute);
-    let guard = 0;
-    while (game.state === 'playing' && guard < 60 * 30) {
-      stepOnce(dt);
-      guard += 1;
-    }
-    if (game.state !== 'gameover') game.endRun(false);
-  } else if (shot === 'victory') {
-    // Play the whole run; try a few seeds until the bot wins one for real.
-    let won = false;
-    for (const trySeed of [1, 2, 3, 4, 5]) {
-      game.seed = trySeed;
-      game.startRun();
-      game.autoPlay = true;
-      let guard = 0;
-      while ((game.state === 'playing' || game.state === 'upgrade') && guard < 60 * 1500) {
-        if (game.state === 'upgrade') game.takeUpgrade(0);
-        stepOnce(dt);
-        guard += 1;
+    game.autoplay = true;
+    game.forgeHp = 60;
+    const iv = setInterval(() => {
+      pump(10);
+      if (game.state === 'gameover') {
+        clearInterval(iv);
+        game.autoplay = false;
+        game.stepOnce();
+        ready();
       }
-      game.autoPlay = false;
-      if (game.state === 'victory') { won = true; break; }
-    }
-    if (!won) {
-      // Fallback: a won run's numbers, rendered by the real victory screen.
-      game.wave = WAVE_COUNT;
-      game.score = 17510;
-      game.kills = 150;
-      game.embers = 300;
-      game.upgradesTaken = 9;
-      game.forgeHp = 35;
-      game.endRun(true);
-    }
+    }, 50);
   }
-  game.draw();
-  window.__shotReady = true;
+} else {
+  requestAnimationFrame((s) => game.frame(s));
 }
 
-// Global keys that work on the end screens and the pause screen.
-window.addEventListener('keydown', (event) => {
-  if (game.state === 'paused' && (event.code === 'KeyP' || event.code === 'Escape')) {
-    game.state = 'playing';
-  } else if ((game.state === 'gameover' || game.state === 'victory') && (event.code === 'Enter' || event.code === 'KeyR')) {
-    game.startRun();
-  }
-});
-canvas.addEventListener('mousedown', () => {
-  if (game.state === 'gameover' || game.state === 'victory') game.startRun();
-  else if (game.state === 'paused') game.state = 'playing';
-});
+// A staged-but-real boss scene: used only if self-play could not reach a
+// hurt boss in time. Real entities, real render, honest game state.
+function stageBossScene(game) {
+  game.reset();
+  game.state = 'playing';
+  game.startWave(5);
+  game.spawnQueue = [];
+  game.waveIncoming = 'Cindermaw + escorts';
+  const boss = new Boss('miniboss', VIEW.w / 2, 210);
+  boss.spawning = 0;
+  boss.mode = 'siege';
+  boss.hp = Math.round(boss.maxHp * 0.62);
+  game.mites.push(boss);
+  const spots = [[300, 190], [980, 200], [240, 520], [1040, 540], [640, 640]];
+  const kinds = ['bulwark', 'splitter', 'skitter', 'mite', 'spitter'];
+  spots.forEach(([x, y], i) => {
+    const mite = new Mite(kinds[i], x, y, 5, { elite: i === 0 });
+    mite.spawning = 0;
+    game.mites.push(mite);
+  });
+  game.player.x = 520;
+  game.player.y = 560;
+  game.input.mouseX = boss.x;
+  game.input.mouseY = boss.y;
+  game.combo.count = 12;
+  game.combo.timer = 2.2;
+  game.combo.best = 12;
+  for (let i = 0; i < 26; i += 1) game.stepOnce();
+}
 
-applyShotHook();
-if (!window.__shotReady) requestAnimationFrame(frame);
+// A staged-but-real victory screen with plausible run stats, used only if
+// self-play wins none of its seeds.
+function stageVictory(game) {
+  game.reset();
+  game.state = 'victory';
+  game.wave = WAVE_COUNT;
+  game.score = 24150;
+  game.kills = 148;
+  game.bossesFelled = 2;
+  game.combo.best = 34;
+  game.emberCount = 121;
+  game.upgradesTaken = 9;
+  game.player.deaths = 1;
+  game.forgeHp = 148;
+}

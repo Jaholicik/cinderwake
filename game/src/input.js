@@ -13,6 +13,7 @@ export class Input {
     this.mouseDown = false;
     this.pressed = new Set(); // keys pressed since last poll, for one-shot actions
     this.clicked = false; // mouse button pressed since last poll
+    this.rightClicked = false; // right button pressed since last poll (dash)
     this._attach();
   }
 
@@ -38,6 +39,9 @@ export class Input {
       if (event.button === 0) {
         this.mouseDown = true;
         this.clicked = true;
+        this._updateMouse(event);
+      } else if (event.button === 2) {
+        this.rightClicked = true;
         this._updateMouse(event);
       }
     });
@@ -66,6 +70,10 @@ export class Input {
     return this.clicked;
   }
 
+  wasRightClicked() {
+    return this.rightClicked;
+  }
+
   // Drive the mouse from code (screenshot hooks / play tests).
   setMouse(x, y, down = false) {
     this.mouseX = x;
@@ -76,5 +84,6 @@ export class Input {
   endFrame() {
     this.pressed.clear();
     this.clicked = false;
+    this.rightClicked = false;
   }
 }
