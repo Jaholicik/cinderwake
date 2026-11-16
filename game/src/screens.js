@@ -3,8 +3,8 @@
 // states — menu, upgrade choice, pause, victory and game over. The world
 // itself is drawn in render.js. Nothing here changes game state.
 
-import { PALETTE, VIEW, WAVE_COUNT } from './config.js';
-import { bar, roundRect } from './render.js';
+import { PALETTE, TURRETS, VIEW, WAVE_COUNT } from './config.js';
+import { bar, drawTurretShape, roundRect } from './render.js';
 
 function abilityChip(ctx, x, y, label, key, fracReadyRaw, color) {
   const fracReady = Math.max(0, Math.min(1, fracReadyRaw));
@@ -43,7 +43,10 @@ export function drawHUD(ctx, game) {
   ctx.fill();
   ctx.fillStyle = PALETTE.text;
   ctx.font = 'bold 22px system-ui, sans-serif';
-  ctx.fillText(`WAVE ${Math.min(game.wave, WAVE_COUNT)} / ${WAVE_COUNT}`, 28, 40);
+  ctx.fillText(
+    game.endless ? `WAVE ${game.wave} — ENDLESS` : `WAVE ${Math.min(game.wave, WAVE_COUNT)} / ${WAVE_COUNT}`,
+    28, 40,
+  );
   ctx.font = '16px system-ui, sans-serif';
   ctx.fillStyle = PALETTE.textDim;
   ctx.fillText(`Score  ${game.score.toLocaleString('en-US')}`, 28, 64);
@@ -76,6 +79,24 @@ export function drawHUD(ctx, game) {
     ctx.font = 'bold 14px system-ui, sans-serif';
     ctx.fillText(boss.type.bossName + (boss.enraged ? ' — ENRAGED' : ''), VIEW.w / 2, 29);
     bar(ctx, x, 36, w, 10, boss.hp / boss.maxHp, boss.enraged ? PALETTE.danger : PALETTE.boss);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = PALETTE.textDim;
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.fillText(`${Math.ceil(boss.hp)} / ${boss.maxHp}`, x + w, 29);
+  }
+
+  // Wave-event banner: the storm while it rages, the surge while it gathers.
+  if (game.state === 'playing' && game.eventPhase === 'active' && game.waveEventKind === 'emberstorm') {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE.ember;
+    ctx.font = 'bold 17px system-ui, sans-serif';
+    ctx.fillText('🔥 EMBER STORM — EMBERS ×2 🔥', VIEW.w / 2, 86);
+  } else if (game.state === 'playing' && game.eventPhase === 'telegraph'
+    && Math.floor(game.time * 4) % 2 === 0) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE.danger;
+    ctx.font = 'bold 17px system-ui, sans-serif';
+    ctx.fillText('⚠ THE VOID SURGES — BOTH FLANKS ⚠', VIEW.w / 2, 86);
   }
 
   // Combo meter, under the enemies panel: the streak and its cooling bar.
@@ -212,8 +233,8 @@ export function drawMenu(ctx, game) {
     'Dash — SHIFT or right-click: a flicker of speed, untouchable mid-dash',
     'Ember Nova — E: a shockwave that wounds and shoves everything near',
     'Mites chew the Forge. Kill them, chain combos, grab their embers.',
-    'Between waves pick 1 of 3 upgrades — gold RARE cards bend the run.',
-    'Fall in battle and you wake at the Forge — at a score cost.',
+    'Between waves: pick 1 of 3 upgrades; spend embers on Forge turrets.',
+    'Survive wave 10 — then ascend, or let the Forge endure (endless).',
   ];
   lines.forEach((line, i) => ctx.fillText('•  ' + line, VIEW.w / 2 - 310, 388 + i * 22));
 
@@ -275,7 +296,63 @@ export function drawUpgrade(ctx, game) {
     ctx.font = 'bold 15px system-ui, sans-serif';
     ctx.fillText(`[${i + 1}]  click to take`, x + cardW / 2, y0 + cardH - 20);
   });
-  subtitle(ctx, 'Press 1, 2 or 3 — or click a card', 560, 16);
+
+  // Placement ghost: hovering a buildable socket previews the turret and
+  // its reach in the arena behind the panel.
+  if (game.hoverTurret >= 0
+    && !game.turrets.some((t) => t.socket === game.hoverTurret && t.alive)) {
+    const s = TURRETS.sockets[game.hoverTurret];
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 166, 43, 0.45)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, TURRETS.range, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.55;
+    drawTurretShape(ctx, s.x, s.y, -Math.PI / 2);
+    ctx.restore();
+  }
+
+  // Forge turret panel: one chip per socket, aligned with the card row.
+  // The chip rectangles are mirrored by turretChipAt() in main.js.
+  const panelY = 522;
+  ctx.fillStyle = 'rgba(26, 26, 62, 0.9)';
+  roundRect(ctx, x0, panelY, totalW, 84, 14);
+  ctx.fill();
+  ctx.strokeStyle = PALETTE.cardEdge;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.textAlign = 'left';
+  ctx.fillStyle = PALETTE.text;
+  ctx.font = 'bold 15px system-ui, sans-serif';
+  ctx.fillText(`FORGE TURRETS — ${TURRETS.cost} ◆ each · click a chip or press T`, x0 + 18, panelY + 24);
+  for (let i = 0; i < TURRETS.sockets.length; i += 1) {
+    const cx = x0 + i * (cardW + gap);
+    const cy = panelY + 36;
+    const turret = game.turrets.find((t) => t.socket === i);
+    const hover = game.hoverTurret === i;
+    ctx.fillStyle = hover ? '#23235a' : PALETTE.card;
+    roundRect(ctx, cx, cy, cardW, 36, 10);
+    ctx.fill();
+    ctx.strokeStyle = hover ? PALETTE.cardHot : PALETTE.cardEdge;
+    ctx.lineWidth = hover ? 2.5 : 1.5;
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px system-ui, sans-serif';
+    if (turret && turret.alive) {
+      ctx.fillStyle = PALETTE.forgeCore;
+      ctx.fillText(`⌖ TURRET ${i + 1} · HP ${Math.ceil(turret.hp)} / ${turret.maxHp}`, cx + cardW / 2, cy + 23);
+    } else if (turret) {
+      ctx.fillStyle = game.embers >= TURRETS.cost ? PALETTE.danger : PALETTE.textDim;
+      ctx.fillText(`⌖ TURRET DOWN · REBUILD ${TURRETS.cost} ◆`, cx + cardW / 2, cy + 23);
+    } else {
+      ctx.fillStyle = game.embers >= TURRETS.cost ? PALETTE.ember : PALETTE.textDim;
+      ctx.fillText(`＋ SOCKET ${i + 1} · BUILD ${TURRETS.cost} ◆`, cx + cardW / 2, cy + 23);
+    }
+  }
+  subtitle(ctx, 'Press 1, 2 or 3 — or click a card', 648, 16);
 }
 
 function wrapText(ctx, text, cx, y, maxW, lineH) {
@@ -313,7 +390,7 @@ function endScreen(ctx, game, won) {
   }
   const stats = [
     ['Final score', game.score.toLocaleString('en-US')],
-    ['Waves survived', `${won ? WAVE_COUNT : game.wave - 1} / ${WAVE_COUNT}`],
+    ['Waves survived', `${won || game.endless ? WAVE_COUNT : game.wave - 1} / ${WAVE_COUNT}`],
     ['Mites slain', String(game.kills)],
     ['Bosses felled', `${game.bossesFelled} / 2`],
     ['Highest combo', `×${game.combo.best}`],
@@ -321,14 +398,19 @@ function endScreen(ctx, game, won) {
     ['Times fallen', String(game.player.deaths)],
     ['Upgrades taken', String(game.upgradesTaken)],
   ];
+  if (game.endless && !won) {
+    // An endless fall records how deep the Forge endured.
+    stats.splice(2, 0, ['Endless — fell on wave', String(game.wave)]);
+  }
+  const boxY = 282 - Math.max(0, stats.length - 8) * 16; // taller tables start higher
   ctx.fillStyle = 'rgba(26, 26, 62, 0.9)';
-  roundRect(ctx, VIEW.w / 2 - 260, 282, 520, 44 + stats.length * 33, 14);
+  roundRect(ctx, VIEW.w / 2 - 260, boxY, 520, 44 + stats.length * 33, 14);
   ctx.fill();
   ctx.strokeStyle = PALETTE.cardEdge;
   ctx.lineWidth = 2;
   ctx.stroke();
   stats.forEach(([label, value], i) => {
-    const y = 322 + i * 33;
+    const y = boxY + 40 + i * 33;
     ctx.textAlign = 'left';
     ctx.fillStyle = PALETTE.textDim;
     ctx.font = '17px system-ui, sans-serif';
@@ -339,13 +421,31 @@ function endScreen(ctx, game, won) {
     ctx.fillText(value, VIEW.w / 2 + 230, y);
   });
 
-  ctx.fillStyle = won ? PALETTE.forgeHot : '#3b3b7a';
+  if (won) {
+    // Two ways onward: a fresh run, or endless — the Forge endures.
+    // The endless rectangle is mirrored by endlessButtonAt() in main.js.
+    ctx.fillStyle = PALETTE.forgeHot;
+    roundRect(ctx, VIEW.w / 2 - 310, 618, 300, 62, 12);
+    ctx.fill();
+    ctx.fillStyle = '#1a0d00';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('↻  PLAY AGAIN', VIEW.w / 2 - 160, 657);
+    ctx.fillStyle = PALETTE.ember;
+    roundRect(ctx, VIEW.w / 2 + 10, 618, 300, 62, 12);
+    ctx.fill();
+    ctx.fillStyle = '#1a0d00';
+    ctx.fillText('∞  THE FORGE ENDURES', VIEW.w / 2 + 160, 657);
+    subtitle(ctx, 'Enter — play again · N — endless waves, escalating', 706, 15);
+    return;
+  }
+  ctx.fillStyle = '#3b3b7a';
   roundRect(ctx, VIEW.w / 2 - 150, 618, 300, 62, 12);
   ctx.fill();
-  ctx.fillStyle = won ? '#1a0d00' : PALETTE.text;
+  ctx.fillStyle = PALETTE.text;
   ctx.font = 'bold 22px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText(won ? '↻  PLAY AGAIN' : '↻  TRY AGAIN', VIEW.w / 2, 657);
+  ctx.fillText('↻  TRY AGAIN', VIEW.w / 2, 657);
   subtitle(ctx, 'click, or press Enter / R to restart', 706, 15);
 }
 

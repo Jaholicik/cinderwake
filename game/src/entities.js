@@ -3,7 +3,8 @@
 // Each class owns its own update step; drawing lives in render.js.
 
 import {
-  ABILITIES, ELITE, SPAWN_TELEGRAPH, clamp, dist, ENEMY_TYPES, FORGE, PALETTE, PLAYER_BASE,
+  ABILITIES, ELITE, ENDLESS, SPAWN_TELEGRAPH, WAVE_COUNT, clamp, dist, ENEMY_TYPES, FORGE,
+  PALETTE, PLAYER_BASE,
 } from './config.js';
 
 let nextId = 1;
@@ -44,6 +45,8 @@ export class Player {
     this.novaRadius = ABILITIES.novaRadius;
     this.novaDamage = ABILITIES.novaDamage;
     this.hurtFlash = 0; // drives the red edge vignette when a hit lands
+    this.hurtDir = 0; // angle toward the last thing that hurt the wisp
+    this.hurtDirTimer = 0; // drives the damage-direction indicator
     // Upgrade-driven extras.
     this.siphon = 0; // extra embers per kill
     this.arcChance = 0; // chance a hit arcs to a neighbour
@@ -92,6 +95,7 @@ export class Player {
     this.dashCd = Math.max(0, this.dashCd - dt);
     this.novaCd = Math.max(0, this.novaCd - dt);
     this.hurtFlash = Math.max(0, this.hurtFlash - dt);
+    this.hurtDirTimer = Math.max(0, this.hurtDirTimer - dt);
     if (this.dashTime > 0) {
       this.dashTime -= dt;
       this.dashTrail.unshift({ x: this.x, y: this.y, facing: this.facing });
@@ -194,10 +198,16 @@ export class Mite {
     this.elite = Boolean(opts.elite);
     this.isBoss = false;
     this.r = type.r * (this.elite ? ELITE.radiusScale : 1);
-    const hpScale = (1 + (wave - 1) * 0.27) * (this.elite ? ELITE.hpScale : 1);
+    // Past wave 10 (endless), the growth steepens so the dark always wins
+    // eventually: extra HP and speed for every wave beyond the campaign.
+    const endlessSteps = Math.max(0, wave - WAVE_COUNT);
+    const hpScale = (1 + (wave - 1) * 0.30 + endlessSteps * ENDLESS.hpPerWave)
+      * (this.elite ? ELITE.hpScale : 1);
     this.maxHp = Math.round(type.hp * hpScale);
     this.hp = this.maxHp;
-    this.speed = type.speed * (1 + (wave - 1) * 0.03) * (this.elite ? ELITE.speedScale : 1);
+    this.speed = type.speed
+      * (1 + (wave - 1) * 0.03 + endlessSteps * ENDLESS.speedPerWave)
+      * (this.elite ? ELITE.speedScale : 1);
     this.mass = this.r / 14; // knockback resistance
     this.kx = 0; // knockback velocity, shoved by bullets and the nova
     this.ky = 0;

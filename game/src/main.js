@@ -3,15 +3,17 @@
 //
 // A guardian wisp defends the last Forge from ten waves of void mites.
 // Survive wave 10 — Cindermaw at 5, the Hollow Maw at 10 — and the Forge
-// ascends. If the Forge falls, the dark wins. Upgrades between waves, a
-// dash and an ember nova in the wisp's hands, combos for the bold.
+// ascends; or let it endure into endless, ever-steeper waves. If the Forge
+// falls, the dark wins. Upgrades and ember turrets between waves, a dash
+// and an ember nova in the wisp's hands, combos for the bold, and mid-wave
+// events — ember storms and void surges — to keep every run honest.
 //
 // States: menu -> playing -> upgrade (between waves) -> playing ...
-//         playing -> gameover | victory; paused overlays playing.
+//         playing -> gameover | victory -> endless; paused overlays playing.
 
 import {
-  ABILITIES, BOSS_WAVES, DEATH_SCORE_COST, EMBER_VALUE, FORGE, PALETTE, VIEW, WAVE_COUNT,
-  clamp, dist, mulberry32,
+  ABILITIES, BOSS_WAVES, DEATH_SCORE_COST, EMBER_VALUE, FORGE, PALETTE, TURRETS, VIEW,
+  WAVE_COUNT, clamp, dist, mulberry32,
 } from './config.js';
 import { SoundBank } from './audio.js';
 import { Boss } from './bosses.js';
@@ -20,17 +22,19 @@ import { Ember, EnemyShot, Mite, Particle, Player } from './entities.js';
 import { Input } from './input.js';
 import {
   drawBackground, drawBoss, drawBullet, drawEmber, drawEnemyShot, drawFloatTexts,
-  drawForge, drawMite, drawNovaFx, drawParticles, drawPlayer, drawVignette, drawZaps,
+  drawForge, drawHurtIndicator, drawMite, drawNovaFx, drawParticles, drawPlayer,
+  drawSockets, drawTurret, drawVignette, drawZaps,
 } from './render.js';
 import { drawGameOver, drawHUD, drawMenu, drawPause, drawUpgrade, drawVictory } from './screens.js';
+import { Turret } from './turrets.js';
 import { rollUpgrades } from './upgrades.js';
-import { buildWave, isFinalWave, spawnPoint, waveMix } from './waves.js';
+import { buildWave, isFinalWave, spawnPoint, waveEvent, waveMix } from './waves.js';
 
 const FIXED_DT = 1 / 60;
 // Autoplay upgrade taste, best first: raw killing power, then the rares
 // that bend a run, then sustain. Shared by the demo and the soak test.
 const UPGRADE_PRIORITY = [
-  'damage', 'multishot', 'firerate', 'starfall', 'arc', 'pierce', 'novamastery',
+  'damage', 'multishot', 'firerate', 'starfall', 'arc', 'pierce', 'turret', 'novamastery',
   'phoenix', 'heavy', 'siphon', 'flicker', 'repair', 'maxhp', 'regen', 'magnet', 'speed',
 ];
 
@@ -74,6 +78,15 @@ class Game {
     this.zaps = [];
     this.combo = new ComboTracker();
     this.ownedUpgrades = [];
+    this.turrets = [];
+    this.turretDamage = TURRETS.damage;
+    this.turretFireRate = TURRETS.fireRate;
+    this.hoverTurret = -1;
+    this.endless = false;
+    this.waveEventKind = null;
+    this.eventPhase = 'none'; // none | pending | telegraph | active | done
+    this.eventClock = 0;
+    this.stormTimer = 0;
     this.phoenixCharges = 0;
     this.bossesFelled = 0;
     this.forgeMaxHp = FORGE.maxHp;
@@ -121,9 +134,28 @@ class Game {
     this.spawnQueue = built.queue.slice();
     this.spawnClock = 0;
     this.waveIncoming = waveMix(wave, 4242);
+    this.waveEventKind = waveEvent(wave);
+    this.eventPhase = this.waveEventKind ? 'pending' : 'none';
+    this.eventClock = 0;
+    this.stormTimer = 0;
     if (BOSS_WAVES[wave]) {
       this.announce(wave >= 10 ? 'THE HOLLOW MAW COMES' : 'CINDERMAW STIRS', PALETTE.boss, 30);
     }
+  }
+
+  // Endless mode: the victory screen's second door. The run continues past
+  // wave 10 with everything earned kept — upgrades, turrets, score — while
+  // the waves steepen (see ENDLESS in config.js) until the Forge falls.
+  startEndless() {
+    this.endless = true;
+    this.state = 'playing';
+    this.sound.unlock();
+    this.startWave(this.wave + 1);
+    this.announce('THE FORGE ENDURES', PALETTE.ember, 30);
+  }
+
+  get stormActive() {
+    return this.eventPhase === 'active' && this.waveEventKind === 'emberstorm';
   }
 
   enemiesLeft() {
@@ -154,7 +186,8 @@ class Game {
   // ---- spawning & kills --------------------------------------------------
 
   spawnFromQueue(dt) {
-    this.spawnClock += dt;
+    // An ember storm hurries the dark in: the queue drains faster.
+    this.spawnClock += dt * (this.stormActive ? 1.75 : 1);
     while (this.spawnQueue.length > 0 && this.spawnQueue[0].at <= this.spawnClock) {
       const entry = this.spawnQueue.shift();
       this.spawnEntry(entry);
@@ -190,8 +223,8 @@ class Game {
     // Hit-stop: the world catches its breath on a kill.
     const stop = mite.isBoss ? 0.14 : mite.elite ? 0.06 : mite.kind === 'brute' || mite.kind === 'bulwark' ? 0.05 : 0.028;
     this.hitStop = Math.max(this.hitStop, stop);
-    // Embers.
-    const drop = mite.emberValue + this.player.siphon;
+    // Embers. An ember storm shakes twice as many loose.
+    const drop = (mite.emberValue + this.player.siphon) * (this.stormActive ? 2 : 1);
     for (let i = 0; i < drop; i += 1) {
       const a = this.rng() * Math.PI * 2;
       const d = this.rng() * 16;
@@ -241,9 +274,137 @@ class Game {
     }
   }
 
-  // A landed hit on the wisp: sound, and the death bookkeeping when it kills.
-  hitPlayer(dmg) {
+  // ---- wave events --------------------------------------------------------
+
+  // The per-wave event clock. Both events are keyed to the wave number
+  // (waves.js), so they fire identically under the demo seed.
+  _updateWaveEvent(dt) {
+    if (this.eventPhase === 'none' || this.eventPhase === 'done') return;
+    this.eventClock += dt;
+    if (this.eventPhase === 'pending') {
+      if (this.waveEventKind === 'emberstorm' && this.eventClock >= 6) {
+        this.eventPhase = 'active';
+        this.stormTimer = 8;
+        this.announce('EMBER STORM — DOUBLE EMBERS', PALETTE.ember, 26);
+        this.sound.waveStart();
+      } else if (this.waveEventKind === 'voidsurge' && this.eventClock >= 5) {
+        this.eventPhase = 'telegraph';
+        this.eventClock = 0;
+        this.announce('THE VOID SURGES — BOTH FLANKS!', PALETTE.danger, 24);
+        this.sound.alarm();
+      }
+    } else if (this.eventPhase === 'telegraph') {
+      // A breath of warning, then fast mites pour in from both flanks.
+      if (this.eventClock >= 1.2) {
+        this.eventPhase = 'done';
+        for (let i = 0; i < 8; i += 1) {
+          const left = i % 2 === 0;
+          const mite = new Mite(
+            'skitter',
+            left ? 36 : VIEW.w - 36,
+            120 + this.rng() * (VIEW.h - 240),
+            this.wave,
+          );
+          mite.spawning = 0.3 + (i >> 1) * 0.18; // a ripple, not a wall
+          this.mites.push(mite);
+          this.burst(mite.x, mite.y, 5, PALETTE.skitter, 120);
+        }
+        this.sound.roar();
+      }
+    } else if (this.eventPhase === 'active') {
+      this.stormTimer -= dt;
+      // The storm rains loose embers around the Forge while it lasts.
+      if (this.rng() < 0.25) {
+        const a = this.rng() * Math.PI * 2;
+        const d = 60 + this.rng() * 130;
+        this.particles.push(new Particle(
+          FORGE.x + Math.cos(a) * d, FORGE.y + Math.sin(a) * d,
+          (this.rng() - 0.5) * 20, -26 - this.rng() * 26,
+          0.8, 3.5, 'rgba(255, 166, 43, 0.8)',
+        ));
+      }
+      if (this.stormTimer <= 0) this.eventPhase = 'done';
+    }
+  }
+
+  // ---- forge turrets ------------------------------------------------------
+
+  turretAt(socketIndex) {
+    return this.turrets.find((t) => t.socket === socketIndex) || null;
+  }
+
+  // Build (or rebuild) the turret on a socket for banked embers. Returns
+  // false when the socket already stands or the embers are not there.
+  tryBuildTurret(socketIndex) {
+    const standing = this.turretAt(socketIndex);
+    if (standing && standing.alive) return false;
+    if (this.emberCount < TURRETS.cost) return false;
+    this.emberCount -= TURRETS.cost;
+    if (standing) this.turrets.splice(this.turrets.indexOf(standing), 1);
+    const turret = new Turret(socketIndex);
+    this.turrets.push(turret);
+    this.burst(turret.x, turret.y, 16, PALETTE.forgeCore, 170);
+    this.floatText(turret.x, turret.y - 30, 'TURRET RAISED', PALETTE.forgeCore, 15);
+    this.sound.build();
+    return true;
+  }
+
+  // The self-play bot spends its banked embers the way a sensible guardian
+  // would: every socket filled, every wreck rebuilt, before picking a card.
+  autoBuildTurrets() {
+    for (let i = 0; i < TURRETS.sockets.length; i += 1) this.tryBuildTurret(i);
+  }
+
+  _updateTurrets(dt) {
+    const stats = { damage: this.turretDamage, fireRate: this.turretFireRate };
+    for (const turret of this.turrets) {
+      const fired = turret.update(dt, this.mites, stats, (bullet) => this.bullets.push(bullet));
+      if (fired) this.sound.turretShoot();
+    }
+  }
+
+  damageTurret(turret, dmg) {
+    turret.hp -= dmg;
+    this.burst(turret.x, turret.y, 5, PALETTE.forgeHot, 120);
+    this.sound.forgeHit();
+    if (turret.hp <= 0 && turret.alive) {
+      turret.hp = 0;
+      turret.alive = false;
+      this.burst(turret.x, turret.y, 26, PALETTE.forgeHot, 240);
+      this.floatText(turret.x, turret.y - 26, 'TURRET DOWN', PALETTE.danger, 16);
+      this.sound.turretDown();
+      this.shake = Math.max(this.shake, 4);
+    }
+  }
+
+  // The turret chips on the upgrade screen; rectangles mirror screens.js.
+  turretChipAt(x, y) {
+    const chipY = 522 + 36;
+    const chipH = 36;
+    if (y < chipY || y > chipY + chipH) return -1;
+    const cardW = 300;
+    const gap = 28;
+    const x0 = (VIEW.w - (cardW * 3 + gap * 2)) / 2;
+    for (let i = 0; i < TURRETS.sockets.length; i += 1) {
+      const cx = x0 + i * (cardW + gap);
+      if (x >= cx && x <= cx + cardW) return i;
+    }
+    return -1;
+  }
+
+  // The victory screen's endless button; rectangle mirrors screens.js.
+  endlessButtonAt(x, y) {
+    return x >= VIEW.w / 2 + 10 && x <= VIEW.w / 2 + 310 && y >= 618 && y <= 680;
+  }
+
+  // A landed hit on the wisp: sound, the direction it came from (for the
+  // damage indicator), and the death bookkeeping when it kills.
+  hitPlayer(dmg, fromX, fromY) {
     if (!this.player.takeHit(dmg)) return;
+    if (fromX !== undefined) {
+      this.player.hurtDir = Math.atan2(fromY - this.player.y, fromX - this.player.x);
+      this.player.hurtDirTimer = 0.65;
+    }
     this.sound.hurt();
     if (!this.player.alive) this.onPlayerDeath();
   }
@@ -362,7 +523,13 @@ class Game {
     }
     if (this.state === 'gameover' || this.state === 'victory') {
       this._updateFx(sdt);
-      if (this.input.wasClicked() || this.input.wasPressed('Enter') || this.input.wasPressed('KeyR')) {
+      // From victory, the endless button (or N) continues this run instead
+      // of restarting it; every other click/key starts fresh.
+      if (this.state === 'victory'
+        && ((this.input.wasClicked() && this.endlessButtonAt(this.input.mouseX, this.input.mouseY))
+          || this.input.wasPressed('KeyN'))) {
+        this.startEndless();
+      } else if (this.input.wasClicked() || this.input.wasPressed('Enter') || this.input.wasPressed('KeyR')) {
         this.startRun();
       }
       this.input.endFrame();
@@ -377,12 +544,30 @@ class Game {
     if (this.state === 'upgrade') {
       this._updateFx(sdt);
       this.hoverCard = this.cardAt(this.input.mouseX, this.input.mouseY);
-      if (this.input.wasClicked() && this.hoverCard >= 0) this.takeUpgrade(this.hoverCard);
-      else if (this.autoplay) this.takeBestUpgrade();
-      else {
+      // Turret placement lives here too: hovering a chip (or a socket in
+      // the arena) previews the build; clicking a chip raises the turret
+      // without ending the draft.
+      const chipHover = this.turretChipAt(this.input.mouseX, this.input.mouseY);
+      let socketHover = -1;
+      for (let i = 0; i < TURRETS.sockets.length; i += 1) {
+        const s = TURRETS.sockets[i];
+        if (dist(this.input.mouseX, this.input.mouseY, s.x, s.y) < 36) socketHover = i;
+      }
+      this.hoverTurret = chipHover >= 0 ? chipHover : socketHover;
+      if (this.input.wasClicked() && chipHover >= 0) this.tryBuildTurret(chipHover);
+      else if (this.input.wasClicked() && this.hoverCard >= 0) this.takeUpgrade(this.hoverCard);
+      else if (this.autoplay) {
+        this.autoBuildTurrets();
+        this.takeBestUpgrade();
+      } else {
         if (this.input.wasPressed('Digit1')) this.takeUpgrade(0);
         if (this.input.wasPressed('Digit2')) this.takeUpgrade(1);
         if (this.input.wasPressed('Digit3')) this.takeUpgrade(2);
+        if (this.input.wasPressed('KeyT')) {
+          for (let i = 0; i < TURRETS.sockets.length; i += 1) {
+            if (this.tryBuildTurret(i)) break;
+          }
+        }
       }
       this.input.endFrame();
       return;
@@ -406,8 +591,10 @@ class Game {
     }
     if (this.autoplay) this._autoplay();
     this._updatePlayer(sdt);
+    this._updateWaveEvent(sdt);
     this.spawnFromQueue(sdt);
     this._updateMites(sdt);
+    this._updateTurrets(sdt);
     this._updateBullets(sdt);
     this._updateEnemyShots(sdt);
     this._updateEmbers(sdt);
@@ -429,9 +616,9 @@ class Game {
       }
     }
 
-    // Wave flow.
+    // Wave flow. In endless there is no final wave: the draft keeps coming.
     if (this.spawnQueue.length === 0 && this.mites.length === 0 && this.state === 'playing') {
-      if (isFinalWave(this.wave)) {
+      if (!this.endless && isFinalWave(this.wave)) {
         this.state = 'victory';
         this.score += 1000;
         this.sound.victory();
@@ -499,8 +686,29 @@ class Game {
       }
       // Contact with the wisp, gated by the mite's own bite cooldown.
       if (this.player.alive && mite.contactTimer <= 0 && result.dPlayer < mite.r + this.player.r) {
-        this.hitPlayer(mite.type.contact);
+        this.hitPlayer(mite.type.contact, mite.x, mite.y);
         mite.contactTimer = 0.6;
+      }
+      // A walking mite that runs into a standing turret stops and chews
+      // it instead: turrets tank the lanes they guard. It is held at
+      // biting distance and takes bites on the same cadence as the Forge.
+      if (!mite.isBoss && !mite.type.ranged) {
+        for (const turret of this.turrets) {
+          if (!turret.alive) continue;
+          const d = dist(mite.x, mite.y, turret.x, turret.y);
+          const biteRange = mite.r + turret.r + 1;
+          if (d < biteRange + 2) {
+            if (d > 0.01 && d < biteRange) {
+              mite.x = turret.x + ((mite.x - turret.x) / d) * biteRange;
+              mite.y = turret.y + ((mite.y - turret.y) / d) * biteRange;
+            }
+            if (mite.attackTimer <= 0) {
+              mite.attackTimer = 0.8;
+              this.damageTurret(turret, mite.type.forgeDps * 0.8);
+            }
+            break;
+          }
+        }
       }
       // Chewing the Forge, in bites worth 0.8s of its damage rate.
       if (result.atForge && mite.attackTimer <= 0) {
@@ -541,8 +749,9 @@ class Game {
           );
           this.sound.hit();
         }
-        // Arc Conductor: lightning leaps to a neighbour.
-        if (this.player.arcChance > 0 && this.rng() < this.player.arcChance) {
+        // Arc Conductor: lightning leaps to a neighbour. (Wisp shots only —
+        // turret bolts are plain, flagged in turrets.js.)
+        if (!bullet.turret && this.player.arcChance > 0 && this.rng() < this.player.arcChance) {
           let best = null;
           let bestD = 150;
           for (const other of this.mites) {
@@ -590,7 +799,7 @@ class Game {
         && dist(shot.x, shot.y, this.player.x, this.player.y) < shot.r + this.player.r) {
         // takeHit returns false through i-frames: the shot flies on.
         if (this.player.invuln <= 0) {
-          this.hitPlayer(shot.damage);
+          this.hitPlayer(shot.damage, shot.x, shot.y);
           shot.dead = true;
         }
       } else if (!shot.fromBoss && dist(shot.x, shot.y, FORGE.x, FORGE.y) < shot.r + FORGE.r - 8) {
@@ -711,14 +920,17 @@ class Game {
     }
     drawBackground(ctx, this.time);
     drawForge(ctx, this, this.time);
+    drawSockets(ctx, this);
     for (const ember of this.emberDrops) drawEmber(ctx, ember);
     for (const mite of this.mites) {
       if (mite.isBoss) drawBoss(ctx, mite, this.time);
       else drawMite(ctx, mite, this.time);
     }
+    for (const turret of this.turrets) drawTurret(ctx, turret);
     for (const shot of this.enemyShots) drawEnemyShot(ctx, shot);
     for (const bullet of this.bullets) drawBullet(ctx, bullet);
     drawPlayer(ctx, this.player, this.time);
+    drawHurtIndicator(ctx, this.player);
     drawNovaFx(ctx, this.novaFx);
     drawZaps(ctx, this.zaps);
     drawParticles(ctx, this.particles);
@@ -769,7 +981,7 @@ window.addEventListener('pointerdown', () => game.sound.unlock(), { once: true }
 
 // Screenshot hooks: deterministic scenes for the build pipeline. Each hook
 // drives the REAL game (self-play or real states) and flags readiness.
-//   ?shot=menu | play | upgrade | victory | gameover   &seed=N
+//   ?shot=menu | play | upgrade | victory | gameover | endless   &seed=N
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 if (shot) {
@@ -819,10 +1031,16 @@ if (shot) {
           game.upgradeChoices = rollUpgrades(game.rng, game.ownedUpgrades);
           if (game.upgradeChoices.some((c) => c.rarity === 'rare')) break;
         }
+        // Show the turret side of the draft too: one turret already raised
+        // (through the real build path), embers banked for more.
+        game.emberCount = Math.max(game.emberCount, 64);
+        game.tryBuildTurret(0);
         game.hoverCard = 1;
         game.input.mouseX = VIEW.w / 2;
         game.input.mouseY = 340;
         game.stepOnce();
+        game.hoverTurret = 1; // preview the second socket's placement ghost
+        game.render();
         ready();
       }
     }, 50);
@@ -857,12 +1075,49 @@ if (shot) {
       }
     }, 50);
   } else if (shot === 'gameover') {
+    // A real defeat at the Hollow Maw: the run's bookkeeping is staged to
+    // a plausible wave-10 state, then the siege itself — boss, escorts and
+    // minions — chews the Forge down with no autoplay rescue. The fall,
+    // the turret fire and the wreckage are all real gameplay.
     game.startRun();
-    game.autoplay = true;
-    game.forgeHp = 60;
+    game.bossesFelled = 1;
+    game.upgradesTaken = 9;
+    game.kills = 163;
+    game.score = 18740;
+    game.emberCount = 107;
+    game.tryBuildTurret(0);
+    game.tryBuildTurret(1); // 50 embers spent; 57 stay banked on the end screen
+    game.startWave(10);
+    game.forgeHp = 52; // already mauled when the scene opens
+    game.player.x = 150; // driven into a corner, out of the fight
+    game.player.y = 700;
+    let ticks = 0;
     const iv = setInterval(() => {
       pump(10);
-      if (game.state === 'gameover') {
+      ticks += 1;
+      // If the turrets hold the siege too long, the Maw's pressure tells:
+      // the Forge is already cracked — the killing bites stay real.
+      if (ticks === 1500 && game.state === 'playing') game.forgeHp = Math.min(game.forgeHp, 12);
+      if (game.state === 'gameover' || ticks > 3000) {
+        clearInterval(iv);
+        game.stepOnce();
+        ready();
+      }
+    }, 50);
+  } else if (shot === 'endless') {
+    // Exercise endless mode headlessly: stage the victory, walk through
+    // the endless door (the same call the button makes), and confirm the
+    // escalated waves beyond 10 actually play.
+    game.startRun();
+    stageVictory(game);
+    game.startEndless();
+    game.autoplay = true;
+    let ticks = 0;
+    const iv = setInterval(() => {
+      pump(10);
+      ticks += 1;
+      const playing = game.endless && game.wave >= 11 && game.state === 'playing' && game.enemiesLeft() > 0;
+      if (playing || ticks > 900) {
         clearInterval(iv);
         game.autoplay = false;
         game.stepOnce();
@@ -898,6 +1153,10 @@ function stageBossScene(game) {
   game.player.y = 560;
   game.input.mouseX = boss.x;
   game.input.mouseY = boss.y;
+  // Turrets up and firing, one already mauled by the siege.
+  game.turrets = [new Turret(0), new Turret(1), new Turret(2)];
+  game.turrets[2].hp = 41;
+  game.emberCount = 38;
   game.combo.count = 12;
   game.combo.timer = 2.2;
   game.combo.best = 12;
@@ -918,4 +1177,5 @@ function stageVictory(game) {
   game.upgradesTaken = 9;
   game.player.deaths = 1;
   game.forgeHp = 148;
+  game.turrets = [new Turret(0), new Turret(1), new Turret(2)];
 }

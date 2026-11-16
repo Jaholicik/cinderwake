@@ -61,6 +61,21 @@ export function isFinalWave(wave) {
   return wave >= WAVE_COUNT;
 }
 
+// Mid-wave events, keyed to the wave number so they fire identically under
+// the demo seed: an EMBER STORM (ember drops double, spawns hurry) and a
+// VOID SURGE (a telegraphed burst of fast mites from both flanks). Boss
+// waves are their own event, so 5 and 10 stay clear; endless waves keep
+// cycling both on a fixed beat.
+export function waveEvent(wave) {
+  if (wave === 3 || wave === 8) return 'emberstorm';
+  if (wave === 7 || wave === 9) return 'voidsurge';
+  if (wave > WAVE_COUNT) {
+    if (wave % 4 === 2) return 'emberstorm';
+    if (wave % 4 === 0) return 'voidsurge';
+  }
+  return null;
+}
+
 // How many of each kind a wave holds, for the HUD's "incoming" line.
 export function waveMix(wave, seed) {
   const built = buildWave(wave, seed);

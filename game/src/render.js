@@ -2,7 +2,7 @@
 // the wisp, the mites and bosses, and the transient effects. Screens and the
 // HUD live in screens.js. Nothing here changes game state.
 
-import { FORGE, PALETTE, SPAWN_TELEGRAPH, VIEW } from './config.js';
+import { FORGE, PALETTE, SPAWN_TELEGRAPH, TURRETS, VIEW } from './config.js';
 
 export function bar(ctx, x, y, w, h, frac, fill, bg = 'rgba(0,0,0,0.55)') {
   ctx.fillStyle = bg;
@@ -263,6 +263,120 @@ export function drawPlayer(ctx, player, time) {
   ctx.moveTo(ax, ay - 5);
   ctx.lineTo(ax, ay + 5);
   ctx.stroke();
+}
+
+// One turret body: a squat stone drum, an ember heart, and a barrel that
+// tracks its target. Shared by the world renderer and the placement ghost
+// on the upgrade screen, so what you preview is what you get.
+export function drawTurretShape(ctx, x, y, angle, flash = 0) {
+  ctx.save();
+  ctx.translate(x, y);
+  // Shadow + stone drum.
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+  ctx.beginPath();
+  ctx.ellipse(0, TURRETS.radius * 0.7, TURRETS.radius * 0.95, TURRETS.radius * 0.35, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#332b47';
+  ctx.beginPath();
+  ctx.arc(0, 0, TURRETS.radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#57497a';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  // Barrel.
+  ctx.rotate(angle);
+  ctx.fillStyle = '#1d1830';
+  ctx.fillRect(0, -3.5, TURRETS.radius + 9, 7);
+  if (flash > 0) {
+    ctx.fillStyle = 'rgba(255, 220, 150, 0.9)';
+    ctx.beginPath();
+    ctx.arc(TURRETS.radius + 12, 0, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.rotate(-angle);
+  // Ember heart.
+  ctx.fillStyle = PALETTE.forgeHot;
+  ctx.beginPath();
+  ctx.arc(0, 0, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.forgeCore;
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+export function drawTurret(ctx, turret) {
+  if (!turret.alive) {
+    // A wreck: the drum split and dark, embers gone. Rebuildable between waves.
+    ctx.save();
+    ctx.translate(turret.x, turret.y);
+    ctx.fillStyle = '#211c30';
+    ctx.beginPath();
+    ctx.arc(0, 0, turret.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(5, 4, 14, 0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-9, -8);
+    ctx.lineTo(-2, 0);
+    ctx.lineTo(-7, 9);
+    ctx.moveTo(10, -6);
+    ctx.lineTo(2, 1);
+    ctx.lineTo(8, 10);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+  drawTurretShape(ctx, turret.x, turret.y, turret.angle, turret.flash);
+  if (turret.hp < turret.maxHp) {
+    bar(ctx, turret.x - 17, turret.y - turret.r - 13, 34, 4,
+      turret.hp / turret.maxHp, turret.hp / turret.maxHp < 0.3 ? PALETTE.danger : PALETTE.forgeHot);
+  }
+}
+
+// The empty sockets: dashed ember rings set into the arena floor. They
+// glow harder on the upgrade screen, where they can be built on.
+export function drawSockets(ctx, game) {
+  const bright = game.state === 'upgrade';
+  TURRETS.sockets.forEach((socket, i) => {
+    if (game.turrets.some((t) => t.socket === i)) return;
+    ctx.save();
+    ctx.strokeStyle = bright ? 'rgba(255, 166, 43, 0.85)' : 'rgba(255, 166, 43, 0.3)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.arc(socket.x, socket.y, TURRETS.radius + 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = bright ? 'rgba(255, 166, 43, 0.9)' : 'rgba(255, 166, 43, 0.4)';
+    ctx.beginPath();
+    ctx.arc(socket.x, socket.y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+// Damage-direction indicator: a hot wedge on the wisp's rim pointing back
+// at whatever just hurt it, fading over the hurt window.
+export function drawHurtIndicator(ctx, player) {
+  if (!player.alive || player.hurtDirTimer <= 0) return;
+  const alpha = Math.min(1, player.hurtDirTimer / 0.65);
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(player.hurtDir);
+  ctx.fillStyle = `rgba(255, 64, 40, ${alpha * 0.55})`;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.arc(0, 0, player.r + 30, -0.55, 0.55);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = `rgba(255, 90, 60, ${alpha * 0.9})`;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(0, 0, player.r + 30, -0.55, 0.55);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawEyes(ctx, mite, look) {

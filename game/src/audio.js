@@ -101,6 +101,9 @@ export class SoundBank {
   forgeHit() { this._tone(110, 0.12, 'square', 0.35, 80); }
   waveStart() { this._tone(220, 0.16, 'triangle', 0.5, 440); this._tone(440, 0.2, 'triangle', 0.4, 660, 0.12); }
   upgrade() { this._tone(523, 0.1, 'sine', 0.5); this._tone(784, 0.14, 'sine', 0.5, null, 0.09); this._tone(1046, 0.2, 'sine', 0.45, null, 0.18); }
+  turretShoot() { this._tone(340, 0.06, 'square', 0.16, 210); }
+  build() { this._tone(196, 0.09, 'triangle', 0.5, 262); this._tone(392, 0.12, 'triangle', 0.45, 523, 0.07); }
+  turretDown() { this._noise(0.3, 0.55, 900); this._tone(300, 0.3, 'sawtooth', 0.3, 60); }
   click() { this._tone(660, 0.05, 'sine', 0.35); }
   gameOver() { this._tone(330, 0.3, 'sawtooth', 0.5, 110); this._tone(220, 0.5, 'sawtooth', 0.45, 55, 0.25); }
   victory() {

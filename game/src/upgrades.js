@@ -1,6 +1,6 @@
 // Between-wave upgrades for CINDERWAKE: the pool of meaningful choices, the
 // roll of three cards, and what each one does to the player or the Forge.
-// Sixteen cards: commons that stack, and rares that bend the run. Some cards
+// Seventeen cards: commons that stack, and rares that bend the run. Some cards
 // name a partner — own one half and the other half is likelier to appear,
 // and taking it lights the synergy the card promises.
 
@@ -76,6 +76,15 @@ export const UPGRADE_POOL = [
     synergyWith: 'novamastery', synergyName: 'Ember Engine',
     desc: 'Every kill shakes loose +1 extra ember. Greed, kindled.',
     apply: (player) => { player.siphon += 1; },
+  },
+  {
+    id: 'turret', name: 'Sentry Tuning', icon: '⌖', rarity: 'common',
+    desc: 'Forge turrets hit +40% harder and fire +25% faster; standing turrets mend to full.',
+    apply: (player, game) => {
+      game.turretDamage *= 1.4;
+      game.turretFireRate *= 1.25;
+      for (const turret of game.turrets) if (turret.alive) turret.hp = turret.maxHp;
+    },
   },
   {
     id: 'arc', name: 'Arc Conductor', icon: '↯', rarity: 'rare',

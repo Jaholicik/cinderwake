@@ -51,6 +51,33 @@ export const FORGE = {
   maxHp: 130,
 };
 
+// Forge turrets: stationary ember cannons the player raises between waves
+// by spending banked embers, one per socket. The sockets ring the Forge at
+// 128px, right on the mites' approach lanes — so a turret both guards the
+// stone and can be chewed down like the stone. Tuning lives here; the
+// Turret class lives in turrets.js.
+export const TURRETS = {
+  cost: 25, // embers to build, or to rebuild a wreck
+  hp: 75,
+  damage: 6,
+  fireRate: 2.2, // shots per second
+  range: 250,
+  bulletSpeed: 660,
+  radius: 15,
+  sockets: [
+    { x: 640, y: 272 }, // north
+    { x: 529, y: 464 }, // south-west
+    { x: 751, y: 464 }, // south-east
+  ],
+};
+
+// Endless mode ("The Forge Endures"): past wave 10 the per-wave growth in
+// entities.js steepens by these extra steps, so the dark eventually wins.
+export const ENDLESS = {
+  hpPerWave: 0.15, // extra HP scale per wave beyond 10
+  speedPerWave: 0.02, // extra speed scale per wave beyond 10
+};
+
 export const PLAYER_BASE = {
   r: 16,
   hp: 100,
